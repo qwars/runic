@@ -4,6 +4,8 @@ Runic — легковесный движок для отображения HTML
 
 Построен на Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 
+![Runic — HTML/CSS/JS виджеты на рабочем столе](examples/my-old-conky/screenshot-2026-09-30_07-17-33.png)
+
 ## Возможности
 
 - **Настоящий веб-рендеринг** — HTML5, CSS3, современный JavaScript через WebKitGTK
@@ -26,6 +28,7 @@ Runic — легковесный движок для отображения HTML
 ### 1. Системные зависимости
 
 **Debian 13 / Ubuntu:**
+
 ```bash
 sudo apt install -y \
     build-essential pkg-config \
@@ -34,11 +37,13 @@ sudo apt install -y \
 ```
 
 **Arch Linux:**
+
 ```bash
 sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
 ```
 
 **Fedora:**
+
 ```bash
 sudo dnf install gtk3-devel webkit2gtk4.0-devel gtk-layer-shell-devel
 ```
@@ -73,14 +78,14 @@ cargo build --release
 
 ### Параметры командной строки
 
-| Параметр | Описание | По умолчанию |
-|---|---|---|
-| `html_path` | Путь к HTML-файлу виджета | (обязательно) |
-| `-w, --width <N>` | Ширина окна в пикселях | на весь экран |
-| `-H, --height <N>` | Высота окна в пикселях | на весь экран |
-| `-x, --x <N>` | Отступ от левого края | 0 |
-| `-y, --y <N>` | Отступ от верхнего края | 0 |
-| `-d, --debug` | Включить подробный вывод | false |
+| Параметр           | Описание                  | По умолчанию  |
+| ------------------ | ------------------------- | ------------- |
+| `html_path`        | Путь к HTML-файлу виджета | (обязательно) |
+| `-w, --width <N>`  | Ширина окна в пикселях    | на весь экран |
+| `-H, --height <N>` | Высота окна в пикселях    | на весь экран |
+| `-x, --x <N>`      | Отступ от левого края     | 0             |
+| `-y, --y <N>`      | Отступ от верхнего края   | 0             |
+| `-d, --debug`      | Включить подробный вывод  | false         |
 
 > **Примечание:** координаты `-x` и `-y` работают только если задан размер окна (`-w` и `-H`).
 
@@ -99,10 +104,12 @@ Runic предоставляет JavaScript-объект `window.ipc` для в�
 ### Отправка сообщения
 
 ```javascript
-window.ipc.postMessage(JSON.stringify({
+window.ipc.postMessage(
+  JSON.stringify({
     action: "exec",
-    payload: { command: "uname -a" }
-}));
+    payload: { command: "uname -a" },
+  }),
+);
 ```
 
 ### Получение ответа
@@ -110,12 +117,12 @@ window.ipc.postMessage(JSON.stringify({
 Определите глобальный обработчик:
 
 ```javascript
-window.onRunicResponse = function(response) {
-    // response.action  — имя действия
-    // response.status  — "success" | "error" | "stream_data"
-    // response.message — текстовое сообщение
-    // response.data    — полезные данные (строка или null)
-    console.log(response);
+window.onRunicResponse = function (response) {
+  // response.action  — имя действия
+  // response.status  — "success" | "error" | "stream_data"
+  // response.message — текстовое сообщение
+  // response.data    — полезные данные (строка или null)
+  console.log(response);
 };
 ```
 
@@ -152,7 +159,6 @@ window.onRunicResponse = function(response) {
 ```
 
 Ответ приходит несколько раз, по одной строке за раз, со статусом `stream_data`. Идеально для `top`, `ping`, `tail -f` и других долгоиграющих команд. Повторный запуск той же команды блокируется, пока предыдущая не завершится.
-
 
 ## Режим отладки
 

@@ -4,6 +4,8 @@ Runic is a lightweight engine for rendering HTML/CSS/JS widgets on Linux desktop
 
 Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 
+![Runic — HTML/CSS/JS виджеты на рабочем столе](examples/my-old-conky/screenshot-2026-09-30_07-17-33.png)
+
 ## Features
 
 - **True web rendering** — HTML5, CSS3, modern JavaScript via WebKitGTK
@@ -26,6 +28,7 @@ Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 ### 1. System dependencies
 
 **Debian 13 / Ubuntu:**
+
 ```bash
 sudo apt install -y \
     build-essential pkg-config \
@@ -34,11 +37,13 @@ sudo apt install -y \
 ```
 
 **Arch Linux:**
+
 ```bash
 sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
 ```
 
 **Fedora:**
+
 ```bash
 sudo dnf install gtk3-devel webkit2gtk4.0-devel gtk-layer-shell-devel
 ```
@@ -73,14 +78,14 @@ The binary will be at `target/release/runic`.
 
 ### Command-line arguments
 
-| Argument | Description | Default |
-|---|---|---|
-| `html_path` | Path to the widget HTML file | (required) |
-| `-w, --width <N>` | Window width in pixels | fullscreen |
-| `-H, --height <N>` | Window height in pixels | fullscreen |
-| `-x, --x <N>` | Offset from left edge | 0 |
-| `-y, --y <N>` | Offset from top edge | 0 |
-| `-d, --debug` | Enable verbose output | false |
+| Argument           | Description                  | Default    |
+| ------------------ | ---------------------------- | ---------- |
+| `html_path`        | Path to the widget HTML file | (required) |
+| `-w, --width <N>`  | Window width in pixels       | fullscreen |
+| `-H, --height <N>` | Window height in pixels      | fullscreen |
+| `-x, --x <N>`      | Offset from left edge        | 0          |
+| `-y, --y <N>`      | Offset from top edge         | 0          |
+| `-d, --debug`      | Enable verbose output        | false      |
 
 > **Note:** `-x` and `-y` coordinates only work when window size is specified (`-w` and `-H`).
 
@@ -99,10 +104,12 @@ Runic provides a JavaScript object `window.ipc` for system interaction.
 ### Sending a message
 
 ```javascript
-window.ipc.postMessage(JSON.stringify({
+window.ipc.postMessage(
+  JSON.stringify({
     action: "exec",
-    payload: { command: "uname -a" }
-}));
+    payload: { command: "uname -a" },
+  }),
+);
 ```
 
 ### Receiving responses
@@ -110,12 +117,12 @@ window.ipc.postMessage(JSON.stringify({
 Define a global handler:
 
 ```javascript
-window.onRunicResponse = function(response) {
-    // response.action  — action name
-    // response.status  — "success" | "error" | "stream_data"
-    // response.message — text message
-    // response.data    — payload (string or null)
-    console.log(response);
+window.onRunicResponse = function (response) {
+  // response.action  — action name
+  // response.status  — "success" | "error" | "stream_data"
+  // response.message — text message
+  // response.data    — payload (string or null)
+  console.log(response);
 };
 ```
 
