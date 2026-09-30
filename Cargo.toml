@@ -16,7 +16,7 @@ rust-version = "1.85"
 gtk = "0.18"
 glib = "0.18"
 gio = "0.18"
-webkit2gtk = { version = "2.0.2", features = ["v2_22"] }
+webkit2gtk = { version = "2.0.2", default-features = false, features = ["v2_22"] }
 gtk-layer-shell = "0.7"
 async-channel = "2"
 serde = { version = "1.0", features = ["derive"] }
