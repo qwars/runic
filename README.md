@@ -4,31 +4,29 @@ Runic is a lightweight engine for rendering HTML/CSS/JS widgets on Linux desktop
 
 Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 
-![Runic — HTML/CSS/JS виджеты на рабочем столе](examples/my-old-conky/screenshot-2026-09-30_07-17-33.png)
-
 ## Features
 
 - **True web rendering** — HTML5, CSS3, modern JavaScript via WebKitGTK
 - **Layer Shell integration** — widgets sit below all windows (or on other layers)
 - **Transparent background** — widgets blend seamlessly into the desktop
-- **Powerful IPC bridge** — 4 built-in actions: file read/write, command execution, streaming output
+- **Powerful IPC bridge** — 6 built-in actions: file read/write, command execution, streaming output, file monitoring
 - **Flexible positioning** — custom size, coordinates, fullscreen mode
 - **Quiet mode** — no log spam by default, debug output enabled with `--debug` flag
 - **Async streaming** — long-running command output flows to widgets in real-time
+- **File monitoring via inotify** — track file changes without polling (zero CPU load while idle)
 - **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (in `--debug` mode)
 
 ## Requirements
 
-- **OS**: Linux with Wayland compositor (Sway, Hyprland, Wayfire, etc.)
-- **System libraries**: GTK 3.24+, WebKitGTK 4.0, gtk-layer-shell
-- **Rust**: 1.70+ (for building)
+- OS: Linux with Wayland compositor (Sway, Hyprland, Wayfire, etc.)
+- System libraries: GTK 3.24+, WebKitGTK 4.0, gtk-layer-shell
+- Rust: 1.70+ (for building)
 
 ## Installation
 
 ### 1. System dependencies
 
 **Debian 13 / Ubuntu:**
-
 ```bash
 sudo apt install -y \
     build-essential pkg-config \
@@ -37,13 +35,11 @@ sudo apt install -y \
 ```
 
 **Arch Linux:**
-
 ```bash
 sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
 ```
 
 **Fedora:**
-
 ```bash
 sudo dnf install gtk3-devel webkit2gtk4.0-devel gtk-layer-shell-devel
 ```
@@ -78,14 +74,14 @@ The binary will be at `target/release/runic`.
 
 ### Command-line arguments
 
-| Argument           | Description                  | Default    |
-| ------------------ | ---------------------------- | ---------- |
-| `html_path`        | Path to the widget HTML file | (required) |
-| `-w, --width <N>`  | Window width in pixels       | fullscreen |
-| `-H, --height <N>` | Window height in pixels      | fullscreen |
-| `-x, --x <N>`      | Offset from left edge        | 0          |
-| `-y, --y <N>`      | Offset from top edge         | 0          |
-| `-d, --debug`      | Enable verbose output        | false      |
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `html_path` | Path to the widget HTML file | (required) |
+| `-w, --width <N>` | Window width in pixels | fullscreen |
+| `-H, --height <N>` | Window height in pixels | fullscreen |
+| `-x, --x <N>` | Offset from left edge | 0 |
+| `-y, --y <N>` | Offset from top edge | 0 |
+| `-d, --debug` | Enable verbose output | false |
 
 > **Note:** `-x` and `-y` coordinates only work when window size is specified (`-w` and `-H`).
 
@@ -108,7 +104,7 @@ window.ipc.postMessage(
   JSON.stringify({
     action: "exec",
     payload: { command: "uname -a" },
-  }),
+  })
 );
 ```
 
@@ -119,7 +115,7 @@ Define a global handler:
 ```javascript
 window.onRunicResponse = function (response) {
   // response.action  — action name
-  // response.status  — "success" | "error" | "stream_data"
+  // response.status  — "success" | "error" | "stream_data" | "watch_data"
   // response.message — text message
   // response.data    — payload (string or null)
   console.log(response);
@@ -160,22 +156,69 @@ Response: `data` contains `stdout` on success or `STDERR:\n...` on error. Comman
 
 Response arrives multiple times, one line at a time, with status `stream_data`. Perfect for `top`, `ping`, `tail -f`, and other long-running commands. Re-running the same command is blocked until the previous one completes.
 
-## Debug mode
+#### `watch` — monitor a file via inotify
+
+```json
+{ "action": "watch", "payload": { "path": "/var/log/syslog", "tail": 10 } }
+```
+
+Tracks file changes using the `inotify` system call (zero CPU load while waiting for events). On each file change, new lines are sent to the widget with status `watch_data`.
+
+**Parameters:**
+- `path` (required) — path to the file to monitor
+- `tail` (optional) — number of last lines to send on startup
+
+**Responses:**
+- `status: "success"` — monitoring started
+- `status: "watch_data"` — new line from the file (in `data`), file path in `message`
+- `status: "error"` — error (file already being monitored, no access, file doesn't exist)
+
+**Usage example:**
+
+```javascript
+// Start monitoring the system log
+window.ipc.postMessage(JSON.stringify({
+    action: "watch",
+    payload: { path: "/var/log/syslog", tail: 20 }
+}));
+
+window.onRunicResponse = function(response) {
+    if (response.action === "watch" && response.status === "watch_data") {
+        console.log(`[${response.message}] ${response.data}`);
+    }
+};
+```
+
+**Important:**
+- Re-running `watch` for the same file will return an error
+- Use the `unwatch` action to stop monitoring
+- Reading system logs (`/var/log/syslog`, `/var/log/auth.log`) requires membership in the `adm` group
+- On log rotation (logrotate), monitoring continues to follow the old file descriptor — a `watch` restart is required
+
+#### `unwatch` — stop file monitoring
+
+```json
+{ "action": "unwatch", "payload": { "path": "/var/log/syslog" } }
+```
+
+Stops monitoring a file previously started via `watch`. The inotify thread terminates, the file descriptor is released.
+
+**Responses:**
+- `status: "success"` — monitoring stopped
+- `status: "error"` — file is not being monitored or path is not specified
+
+### Debug mode
 
 The `--debug` flag enables:
 
 - All IPC messages printed to terminal
 - `console.log` from JS redirected to stdout
 - Size and positioning information
-- **Hot-reload**: automatic widget reload when `.html`, `.css`, `.js` files change in the widget directory (300ms debounce protection)
+- Hot-reload: automatic widget reload when `.html`, `.css`, `.js` files change in the widget directory (300ms debounce protection)
 
 ```bash
 cargo run -- examples/test.html/index.html --debug
 ```
-
-### Widget errors
-
-Command and operation errors are displayed inside the widget (in red text), without cluttering system logs. This allows widgets to gracefully handle failures via CSS/JS.
 
 ## License
 

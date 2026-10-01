@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Runic Log Monitor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="widget-container">
+        <header>
+            <h1>🛠️ Runic Log Monitor</h1>
+            <div class="controls">
+                <button class="monitor-btn" data-path="/var/log/syslog" data-name="Syslog" onclick="toggleMonitor(this)">▶ Запустить Syslog</button>
+                <button class="monitor-btn" data-path="/var/log/auth.log" data-name="Auth" onclick="toggleMonitor(this)">▶ Запустить Auth</button>
+                <button class="monitor-btn" data-path="/var/log/kern.log" data-name="Kernel" onclick="toggleMonitor(this)">▶ Запустить Kernel</button>
+                <button class="monitor-btn" data-path="/var/log/tor/notices.log" data-name="Tor" onclick="toggleMonitor(this)">▶ Запустить Tor</button>
+                <button class="stop-all-btn" onclick="stopAllMonitoring()">⏹ Остановить всё</button>
+            </div>
+        </header>
+        <main>
+            <div id="log-container" class="log-container">
+                <div class="log-entry log-info">
+                    <span class="timestamp">[System]</span> Виджет загружен. Выберите логи для мониторинга.
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
