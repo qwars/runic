@@ -23,23 +23,17 @@ use webkit2gtk::{
 #[derive(Parser, Debug)]
 #[command(name = "runic", about = "HTML-виджет для рабочего стола")]
 struct Args {
-    /// Путь к HTML-файлу виджета
-    html_path: String,
-    /// Ширина окна (если не задана, окно растягивается на весь экран)
     #[arg(short = 'w', long)]
     width: Option<i32>,
-    /// Высота окна (если не задана, окно растягивается на весь экран)
     #[arg(short = 'H', long)]
     height: Option<i32>,
-    /// Координата X от левого края (работает только если задан размер)
     #[arg(short = 'x', long, default_value = "0")]
     x: i32,
-    /// Координата Y от верхнего края (работает только если задан размер)
     #[arg(short = 'y', long, default_value = "0")]
     y: i32,
-    /// Включить подробный вывод в терминал (отладка)
     #[arg(short = 'd', long, default_value = "false")]
     debug: bool,
+    html_path: String,
 }
 
 #[derive(Deserialize)]
@@ -204,43 +198,46 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
         "watch" => {
             let path = request.payload.get("path").and_then(|v| v.as_str());
             let tail = request.payload.get("tail").and_then(|v| v.as_u64());
-
             if let Some(p) = path {
-                let path = p.to_string();
+                let path_str = p.to_string();
+
                 {
                     let positions = state.watch_positions.lock().unwrap();
-                    if positions.contains_key(&path) {
+                    if positions.contains_key(&path_str) {
                         send_js("watch", "error", "Файл уже мониторится", None);
                         return;
                     }
                 }
 
-                let initial_pos = match fs::metadata(&path) {
+                if !std::path::Path::new(&path_str).exists() {
+                    if let Some(parent) = std::path::Path::new(&path_str).parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::File::create(&path_str);
+                }
+
+                let initial_pos = match fs::metadata(&path_str) {
                     Ok(meta) => meta.len(),
                     Err(_) => 0,
                 };
-
                 {
                     let mut positions = state.watch_positions.lock().unwrap();
-                    positions.insert(path.clone(), initial_pos);
+                    positions.insert(path_str.clone(), initial_pos);
                 }
 
                 if let Some(n) = tail {
-                    let path_clone = path.clone();
+                    let path_clone = path_str.clone();
                     let sender_clone = js_sender.clone();
-
                     thread::spawn(move || {
                         if let Ok(file) = fs::File::open(&path_clone) {
                             let reader = BufReader::new(file);
                             let lines: Vec<String> =
                                 reader.lines().filter_map(|l| l.ok()).collect();
-
                             let start = if lines.len() > n as usize {
                                 lines.len() - n as usize
                             } else {
                                 0
                             };
-
                             for line in lines.iter().skip(start) {
                                 let response = RustResponse {
                                     action: "watch".to_string(),
@@ -260,7 +257,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     });
                 }
 
-                let path_clone = path.clone();
+                let path_clone = path_str.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
 
@@ -275,21 +272,23 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 data: None,
                             };
                             if let Ok(json) = serde_json::to_string(&response) {
-                                let js = format!(
+                                let _ = sender_clone.send_blocking(format!(
                                     "if (window.onRunicResponse) window.onRunicResponse({});",
                                     json
-                                );
-                                let _ = sender_clone.send_blocking(js);
+                                ));
                             }
                             return;
                         }
                     };
 
-                    match inotify
-                        .watches()
-                        .add(&path_clone, inotify::WatchMask::MODIFY)
-                    {
-                        Ok(w) => w,
+                    match inotify.watches().add(
+                        &path_clone,
+                        inotify::WatchMask::MODIFY
+                            | inotify::WatchMask::CREATE
+                            | inotify::WatchMask::MOVED_TO
+                            | inotify::WatchMask::CLOSE_WRITE,
+                    ) {
+                        Ok(_) => {}
                         Err(e) => {
                             let response = RustResponse {
                                 action: "watch".to_string(),
@@ -298,20 +297,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 data: None,
                             };
                             if let Ok(json) = serde_json::to_string(&response) {
-                                let js = format!(
+                                let _ = sender_clone.send_blocking(format!(
                                     "if (window.onRunicResponse) window.onRunicResponse({});",
                                     json
-                                );
-                                let _ = sender_clone.send_blocking(js);
+                                ));
                             }
                             return;
                         }
                     };
 
                     let mut buffer = [0; 1024];
+                    let mut last_event_time = std::time::Instant::now();
 
                     loop {
-                        // Проверяем, активен ли еще мониторинг
                         {
                             let positions = state_clone.watch_positions.lock().unwrap();
                             if !positions.contains_key(&path_clone) {
@@ -321,26 +319,41 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
 
                         match inotify.read_events_blocking(&mut buffer) {
                             Ok(events) => {
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_event_time).as_millis() < 100 {
+                                    continue;
+                                }
+                                last_event_time = now;
+
                                 for _event in events {
-                                    // Читаем новые строки с последней позиции
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+
                                     if let Ok(mut file) = fs::File::open(&path_clone) {
                                         let mut positions =
                                             state_clone.watch_positions.lock().unwrap();
-                                        if let Some(&pos) = positions.get(&path_clone) {
+
+                                        if let Some(pos) = positions.get_mut(&path_clone) {
                                             use std::io::{Read, Seek, SeekFrom};
 
-                                            // Переходим на сохраненную позицию
-                                            if file.seek(SeekFrom::Start(pos)).is_err() {
+                                            let meta = match fs::metadata(&path_clone) {
+                                                Ok(m) => m,
+                                                Err(_) => continue,
+                                            };
+
+                                            // КРИТИЧЕСКИ ВАЖНО: Защита от усечения (truncate)
+                                            if meta.len() < *pos {
+                                                *pos = 0;
+                                            }
+
+                                            if file.seek(SeekFrom::Start(*pos)).is_err() {
                                                 continue;
                                             }
 
-                                            // Читаем оставшиеся данные
                                             let mut content = String::new();
                                             if file.read_to_string(&mut content).is_err() {
                                                 continue;
                                             }
 
-                                            // Разбиваем на строки и отправляем
                                             for line in content.lines() {
                                                 if !line.is_empty() {
                                                     let response = RustResponse {
@@ -361,10 +374,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 }
                                             }
 
-                                            // Обновляем позицию на текущую длину файла
-                                            if let Ok(meta) = fs::metadata(&path_clone) {
-                                                positions.insert(path_clone.clone(), meta.len());
-                                            }
+                                            *pos = meta.len();
                                         }
                                     }
                                 }
@@ -377,18 +387,16 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     data: None,
                                 };
                                 if let Ok(json) = serde_json::to_string(&response) {
-                                    let js = format!(
+                                    let _ = sender_clone.send_blocking(format!(
                                         "if (window.onRunicResponse) window.onRunicResponse({});",
                                         json
-                                    );
-                                    let _ = sender_clone.send_blocking(js);
+                                    ));
                                 }
                                 break;
                             }
                         }
                     }
 
-                    // Удаляем из мониторинга при завершении
                     state_clone
                         .watch_positions
                         .lock()
@@ -655,20 +663,16 @@ fn main() {
     let state_for_resume = Arc::clone(&app_state);
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
-
     std::thread::spawn(move || {
         let mut last_time = std::time::SystemTime::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let now = std::time::SystemTime::now();
-
             if let Ok(elapsed) = now.duration_since(last_time) {
-                // Если прошло больше 15 секунд, значит система была в режиме сна
                 if elapsed > std::time::Duration::from_secs(15) {
                     if is_debug_for_resume {
                         eprintln!("[Runic Debug] Обнаружен выход из сна. Перезагрузка виджета...");
                     }
-
                     if let Ok(mut streams) = state_for_resume.running_streams.lock() {
                         streams.clear();
                     }
@@ -705,7 +709,6 @@ mod tests {
 
     fn get_response(receiver: &async_channel::Receiver<String>) -> RustResponse {
         let js_code = receiver.recv_blocking().expect("Должно прийти сообщение");
-        // Извлекаем JSON из JS-обертки
         let json_str = js_code
             .trim_start_matches("if (window.onRunicResponse) window.onRunicResponse(")
             .trim_end_matches(");");
@@ -723,7 +726,6 @@ mod tests {
             action: "read".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
-
         handle_action(state, request, sender);
 
         let response = get_response(&receiver);
@@ -737,12 +739,10 @@ mod tests {
     #[test]
     fn test_handle_action_read_error() {
         let (state, sender, receiver) = setup_test_state();
-
         let request = JsMessage {
             action: "read".to_string(),
             payload: json!({"path": "/nonexistent/path/file.txt"}),
         };
-
         handle_action(state, request, sender);
 
         let response = get_response(&receiver);
@@ -761,7 +761,6 @@ mod tests {
             action: "write".to_string(),
             payload: json!({"path": file_path.to_str().unwrap(), "data": "appended data"}),
         };
-
         handle_action(state, request, sender);
 
         let response = get_response(&receiver);
@@ -777,12 +776,10 @@ mod tests {
     #[test]
     fn test_handle_action_exec_success() {
         let (state, sender, receiver) = setup_test_state();
-
         let request = JsMessage {
             action: "exec".to_string(),
             payload: json!({"command": "echo -n 'hello world'"}),
         };
-
         handle_action(state, request, sender);
 
         let response = get_response(&receiver);
@@ -794,12 +791,10 @@ mod tests {
     #[test]
     fn test_handle_action_unknown() {
         let (state, sender, receiver) = setup_test_state();
-
         let request = JsMessage {
             action: "unknown_action".to_string(),
             payload: json!({}),
         };
-
         handle_action(state, request, sender);
 
         let response = get_response(&receiver);
@@ -825,11 +820,9 @@ mod tests {
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "success");
 
-        // Проверяем, что путь добавлен в watch_positions
         let positions = state.watch_positions.lock().unwrap();
         assert!(positions.contains_key(file_path.to_str().unwrap()));
 
-        // Даем потоку время инициализироваться, затем останавливаем мониторинг
         drop(positions);
         std::thread::sleep(std::time::Duration::from_millis(100));
         state
@@ -837,7 +830,6 @@ mod tests {
             .lock()
             .unwrap()
             .remove(file_path.to_str().unwrap());
-
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -848,7 +840,6 @@ mod tests {
         let file_path = temp_dir.join("runic_test_watch_dup.log");
         std::fs::write(&file_path, "line\n").unwrap();
 
-        // Первый запуск
         let request1 = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
@@ -856,18 +847,17 @@ mod tests {
         handle_action(Arc::clone(&state), request1, sender.clone());
         let _ = get_response(&receiver);
 
-        // Второй запуск того же файла — должен вернуть ошибку
         let request2 = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), request2, sender);
+
         let response = get_response(&receiver);
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "error");
         assert_eq!(response.message, "Файл уже мониторится");
 
-        // Очистка
         std::thread::sleep(std::time::Duration::from_millis(100));
         state
             .watch_positions
@@ -884,7 +874,6 @@ mod tests {
         let file_path = temp_dir.join("runic_test_unwatch.log");
         std::fs::write(&file_path, "line\n").unwrap();
 
-        // Сначала запускаем watch
         let watch_request = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
@@ -894,17 +883,16 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Теперь останавливаем
         let unwatch_request = JsMessage {
             action: "unwatch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), unwatch_request, sender);
+
         let response = get_response(&receiver);
         assert_eq!(response.action, "unwatch");
         assert_eq!(response.status, "success");
 
-        // Проверяем, что путь удален из watch_positions
         let positions = state.watch_positions.lock().unwrap();
         assert!(!positions.contains_key(file_path.to_str().unwrap()));
 
@@ -914,7 +902,6 @@ mod tests {
     #[test]
     fn test_handle_action_unwatch_not_watched() {
         let (state, sender, receiver) = setup_test_state();
-
         let request = JsMessage {
             action: "unwatch".to_string(),
             payload: json!({"path": "/tmp/nonexistent_watch.log"}),

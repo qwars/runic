@@ -1,0 +1,462 @@
+:root {
+    --text-font:
+        normal normal 400 normal 16px/1.5 -apple-system, "Segoe UI", system-ui,
+        Roboto, "Noto Sans", "Helvetica Neue", sans-serif;
+    --title-font: normal normal 400 normal 16px/1.5 "FFF Tusj", sans-serif;
+    --extra-font: normal normal 400 normal 14px/1.5 "Rubik Dirt", sans-serif;
+    --mono-font:
+        normal normal 400 normal 13px/1.5 SFMono-Regular, Menlo, Monaco, Consolas,
+        "Nimbus Mono L", "Tlwg Mono", "Ubuntu Mono", "Liberation Mono",
+        "Courier New", monospace;
+    --main-color: lawngreen;
+    --warn-color: khaki;
+    --error-color: darkred
+}
+
+html {
+    background: black;
+}
+
+body {
+    margin: 0 0 0 auto;
+    padding: 10px;
+    background-color: transparent;
+    font: var(--text-font);
+    color: var(--main-color);
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0px;
+    float: right;
+    min-width: 640px;
+    max-width: 33%;
+    cursor: default;
+}
+
+body>section {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0px 1em;
+}
+
+body>section:first-child {
+    max-height: unset;
+}
+
+svg {
+    min-width: 1em;
+    display: block;
+}
+
+svg * {
+    fill: white
+}
+
+svg text {
+    fill: var(--main-color)
+}
+
+figure {
+    margin: 0px;
+    padding: 0px;
+}
+
+#clock-time {
+    font: var(--title-font);
+    font-size: 5em;
+    color: white;
+}
+
+.datetime {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-end;
+    font: var(--extra-font);
+    font-size: 2em;
+    flex-grow: 1;
+    line-height: normal;
+}
+
+#clock-date {
+    display: block;
+    color: white;
+    align-self: flex-start;
+}
+
+.wifi-state {
+    align-self: stretch;
+    position: relative;
+}
+
+.wifi-state svg {
+    height: 100%;
+    min-width: 10em;
+}
+
+#wifi-status path {
+    fill: none;
+    stroke: white;
+}
+
+#wifi-status.main path:not(:nth-child(1)) {
+    fill: var(--main-color);
+    stroke: none;
+}
+
+#wifi-status.warn path:not( :is( :nth-child(1), :nth-child(2))) {
+    fill: var(--warn-color);
+    stroke: none;
+}
+
+#wifi-status.error path:not( :is( :nth-child(1), :nth-child(2), :nth-child(3))) {
+    fill: var(--error-color);
+    stroke: none;
+}
+
+#wifi-status.full path {
+    fill: white;
+    stroke: none;
+}
+
+.thermometer-state,
+.battery-state {
+    display: flex;
+    align-items: center;
+}
+
+.thermometer-state svg {
+    width: 2em;
+}
+
+.battery-state svg {
+    width: 4em
+}
+
+#battery {
+    fill: darkgreen
+}
+
+#battery.warn {
+    fill: var(--warn-color)
+}
+
+#battery.error {
+    fill: var(--error-color)
+}
+
+.battery-state {
+    position: relative;
+}
+
+.battery-state figcaption {
+    position: absolute;
+    left: 0px;
+    right: 0px;
+    margin: auto;
+    text-align: center;
+}
+
+.thermometer-state,
+span:has(#uptime) {
+    flex-grow: 1;
+}
+
+span:has(#uptime) {
+    text-align: right;
+}
+
+section:has(#top-processes) {
+    border: 1px dashed var(--warn-color);
+    border-width: 1px 0px;
+}
+
+#top-processes {
+    flex-grow: 1;
+}
+
+@keyframes typing {
+    0% {
+        width: 8ch;
+    }
+
+    50%,
+    100% {
+        width: 11ch;
+    }
+}
+
+#top-processes>thead th:not(:first-child) {
+    width: 1px;
+}
+
+#top-processes>thead th {
+    border-bottom: 1px dashed var(--warn-color);
+}
+
+#top-processes td:not(:first-child) {
+    text-align: right;
+    padding: 0px 1ex;
+}
+
+#top-processes:has(td:nth-child(3):empty) td:nth-child(1)>code {
+    color: var(--warn-color);
+    font: var(--mono-font);
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    width: 8ch;
+    animation: typing 2s steps(11) infinite;
+}
+
+
+.tor-state,
+.net-state,
+.net-down-state,
+.net-up-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 0px 1ex;
+    font: var(--extra-font);
+    font-size: xx-large;
+    line-height: normal;
+}
+
+.net-down-state,
+.net-up-state {
+    line-height: 0%;
+}
+
+#tor-status {
+    font-size: 2em;
+    line-height: 80%;
+    transform: translateY(-.1ex);
+}
+
+.net-state code,
+.net-down-state code,
+.net-up-state code {
+    font: var(--text-font);
+    white-space: nowrap;
+}
+
+section:has(#tor-status) {
+    flex-wrap: wrap;
+}
+
+section:has(#tor-status)>div {
+    display: inline-flex;
+    flex-grow: 1;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1em;
+}
+
+.headset-state {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-grow: 1power;
+    transition: opacity .3s, transform .3s;
+}
+
+.headset-state svg {
+    width: 2em;
+    opacity: .95;
+}
+
+.headset-state figcaption>span:last-child {
+    font: var(--extra-font);
+    font-size: 3em;
+    opacity: 0;
+    transform: scale(0);
+    transition: opacity .3s, transform .3s;
+    position: absolute;
+    left: -50%;
+    top: -.75ex;
+}
+
+.headset-state figcaption>span:first-child {
+    margin-left: 1ex;
+}
+
+.headset-state:hover figcaption>span:last-child {
+    opacity: 1;
+    transform: scale(1);
+}
+
+.headset-state:has(figcaption>span:first-child:empty) {
+    opacity: 0;
+    transform: scale(0);
+}
+
+.wttr-state {
+    display: flex;
+    align-items: center;
+    flex-grow: 1;
+}
+
+.wttr-state>code {
+    font-size: 2.5em;
+    white-space: nowrap;
+}
+
+.email-state,
+.news-state,
+.agenda-state {
+    position: relative;
+}
+
+.email-state svg,
+.news-state svg,
+.agenda-state svg {
+    width: 5em;
+}
+
+.email-state figcaption,
+.news-state figcaption,
+.agenda-state figcaption {
+    position: absolute;
+    bottom: .3ex;
+    right: .3ex;
+    font: var(--extra-font);
+    font-size: xx-large;
+}
+
+.news-state svg {
+    transform: scale(.9) translateX(5px)
+}
+
+.agenda-state svg {
+    transform: scale(.9) translateY(-8px);
+}
+
+section:has(.player-state) {
+    gap: 1ex
+}
+
+.player-state,
+.sound-state,
+#microphone-state {
+    display: flex;
+    gap: 1ex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.player-state {
+    flex-direction: row-reverse;
+    flex-grow: 1;
+    padding-right: 1ex;
+}
+
+.player-state figcaption {
+    font-size: 18px;
+    transition: opacity .3s;
+}
+
+.player-state:not(:hover):has(figcaption > span:empty) {
+    opacity: .75;
+}
+
+.player-state:hover {
+    opacity: 1;
+}
+
+.player-state svg {
+    width: 2.5em;
+}
+
+.iptv-state {
+    cursor: pointer;
+}
+
+.iptv-state svg {
+    width: 2.5em;
+}
+
+.sound-state svg,
+#microphone-state svg {
+    width: 3em;
+}
+
+.sound-state figcaption,
+#microphone-state figcaption {
+    font: var(--extra-font);
+    font-size: 1em;
+    opacity: 1;
+    margin-left: -4ex;
+    transform: scale(0);
+    transition: opacity .3s, transform .3s, margin-left .3s;
+}
+
+.sound-state:hover figcaption,
+#microphone-state:hover figcaption {
+    opacity: 1;
+    transform: scale(1);
+    margin-left: 0px;
+}
+
+.is-muted {
+    opacity: .5;
+}
+
+#music-title {
+    background-size: contain;
+    background-position: left center;
+    background-repeat: no-repeat;
+    align-self: center;
+    flex-grow: 1;
+    display: flex;
+    height: 3em;
+}
+
+#music-title>span {
+    align-self: center;
+    flex-grow: 1;
+    display: inline-block;
+    width: 0px;
+    margin-left: 2em;
+    text-shadow: 0 0 4px black,
+        2px 2px 4px black,
+        2px 2px 4px black,
+        2px 2px 4px black,
+        -2px -2px 4px black,
+        -2px -2px 4px black,
+        -2px -2px 4px black;
+    justify-self: stretch;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#music-title[style]:has(span:empty):before {
+    content: '\2744';
+    color: whitesmoke;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    animation: spin .8s linear infinite;
+    font-size: 2.5em;
+    line-height: 30%;
+    margin-left: .3ex;
+}
+
+@keyframes spin {
+    50% {
+        transform: rotateY(90deg);
+    }
+}
+
+code {
+    color: whitesmoke;
+}
+
+code:empty:before {
+    content: '\2744';
+    color: whitesmoke;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    animation: spin .8s linear infinite;
+}
