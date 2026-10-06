@@ -9,7 +9,7 @@ use gtk_layer_shell::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -23,17 +23,37 @@ use webkit2gtk::{
 #[derive(Parser, Debug)]
 #[command(name = "runic", about = "HTML-виджет для рабочего стола")]
 struct Args {
-    #[arg(short = 'w', long)]
+    #[arg(short = 'w', long, help = "Ширина окна виджета (в пикселях)")]
     width: Option<i32>,
-    #[arg(short = 'H', long)]
+
+    #[arg(short = 'H', long, help = "Высота окна виджета (в пикселях)")]
     height: Option<i32>,
-    #[arg(short = 'x', long, default_value = "0")]
+
+    #[arg(
+        short = 'x',
+        long,
+        default_value = "0",
+        help = "Отступ от левого края экрана"
+    )]
     x: i32,
-    #[arg(short = 'y', long, default_value = "0")]
+
+    #[arg(
+        short = 'y',
+        long,
+        default_value = "0",
+        help = "Отступ от верхнего края экрана"
+    )]
     y: i32,
-    #[arg(short = 'd', long, default_value = "false")]
+
+    #[arg(
+        short = 'd',
+        long,
+        help = "Включить режим отладки (hot-reload, вывод в консоль)"
+    )]
     debug: bool,
-    html_path: String,
+
+    #[arg(help = "Путь к HTML-файлу виджета", value_name = "FILE")]
+    html_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -52,8 +72,15 @@ struct RustResponse {
 
 struct AppState {
     running_streams: Mutex<HashSet<String>>,
-    watch_positions: Mutex<HashMap<String, u64>>,
+    watch_positions: Mutex<HashMap<String, Option<u64>>>,
     is_debug: bool,
+}
+
+fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        eprintln!("[Runic Warning] Mutex was poisoned, recovering...");
+        poisoned.into_inner()
+    })
 }
 
 fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<String>) {
@@ -90,7 +117,18 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                match OpenOptions::new().create(true).append(true).open(path) {
+                let append = request
+                    .payload
+                    .get("append")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(append)
+                    .truncate(!append)
+                    .open(path)
+                {
                     Ok(mut file) => match file.write_all(d.as_bytes()).and_then(|_| file.flush()) {
                         Ok(_) => send_js("write", "success", "OK", None),
                         Err(e) => send_js("write", "error", &format!("{}", e), None),
@@ -128,7 +166,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                 return;
             }
             {
-                let mut running = state.running_streams.lock().unwrap();
+                let mut running = safe_lock(&state.running_streams);
                 if !running.insert(target.clone()) {
                     send_js("stream", "error", "Уже выполняется", None);
                     return;
@@ -138,11 +176,17 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             let state_clone = Arc::clone(&state);
             let sender_clone = js_sender.clone();
             thread::spawn(move || {
+                let stderr_mode = if state_clone.is_debug {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                };
+
                 let child = Command::new("sh")
                     .arg("-c")
                     .arg(&target_clone)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stderr(stderr_mode)
                     .spawn();
                 match child {
                     Ok(mut proc) => {
@@ -187,11 +231,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         }
                     }
                 }
-                state_clone
-                    .running_streams
-                    .lock()
-                    .unwrap()
-                    .remove(&target_clone);
+                safe_lock(&state_clone.running_streams).remove(&target_clone);
             });
             send_js("stream", "success", "Запущен", None);
         }
@@ -200,217 +240,150 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             let tail = request.payload.get("tail").and_then(|v| v.as_u64());
             if let Some(p) = path {
                 let path_str = p.to_string();
+                let path_buf = std::path::PathBuf::from(&path_str);
 
                 {
-                    let positions = state.watch_positions.lock().unwrap();
+                    let mut positions = safe_lock(&state.watch_positions);
                     if positions.contains_key(&path_str) {
                         send_js("watch", "error", "Файл уже мониторится", None);
                         return;
                     }
-                }
-
-                if !std::path::Path::new(&path_str).exists() {
-                    if let Some(parent) = std::path::Path::new(&path_str).parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::File::create(&path_str);
-                }
-
-                let initial_pos = match fs::metadata(&path_str) {
-                    Ok(meta) => meta.len(),
-                    Err(_) => 0,
-                };
-                {
-                    let mut positions = state.watch_positions.lock().unwrap();
-                    positions.insert(path_str.clone(), initial_pos);
+                    let file_state = if path_buf.exists() {
+                        let pos = match fs::metadata(&path_buf) {
+                            Ok(meta) => meta.len(),
+                            Err(_) => 0,
+                        };
+                        Some(pos)
+                    } else {
+                        None
+                    };
+                    positions.insert(path_str.clone(), file_state);
                 }
 
                 if let Some(n) = tail {
-                    let path_clone = path_str.clone();
-                    let sender_clone = js_sender.clone();
-                    thread::spawn(move || {
-                        if let Ok(file) = fs::File::open(&path_clone) {
-                            let reader = BufReader::new(file);
-                            let lines: Vec<String> =
-                                reader.lines().filter_map(|l| l.ok()).collect();
-                            let start = if lines.len() > n as usize {
-                                lines.len() - n as usize
-                            } else {
-                                0
-                            };
-                            for line in lines.iter().skip(start) {
-                                let response = RustResponse {
-                                    action: "watch".to_string(),
-                                    status: "watch_data".to_string(),
-                                    message: path_clone.clone(),
-                                    data: Some(line.clone()),
-                                };
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let js = format!(
-                                        "if (window.onRunicResponse) window.onRunicResponse({});",
-                                        json
-                                    );
-                                    let _ = sender_clone.send_blocking(js);
+                    if path_buf.exists() {
+                        let path_clone = path_str.clone();
+                        let sender_clone = js_sender.clone();
+                        thread::spawn(move || {
+                            if let Ok(mut file) = fs::File::open(&path_clone) {
+                                if let Ok(meta) = file.metadata() {
+                                    let file_len = meta.len();
+                                    if file_len > 0 {
+                                        let read_size = std::cmp::min(file_len, 64 * 1024);
+                                        let _ = file.seek(SeekFrom::End(-(read_size as i64)));
+                                        let mut content = String::new();
+                                        let _ = file.read_to_string(&mut content);
+
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        let start = if lines.len() > n as usize {
+                                            lines.len() - n as usize
+                                        } else {
+                                            0
+                                        };
+                                        for line in lines.iter().skip(start) {
+                                            let response = RustResponse {
+                                                action: "watch".to_string(),
+                                                status: "watch_data".to_string(),
+                                                message: path_clone.clone(),
+                                                data: Some(line.to_string()),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                let js = format!(
+                                                    "if (window.onRunicResponse) window.onRunicResponse({});",
+                                                    json
+                                                );
+                                                let _ = sender_clone.send_blocking(js);
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
 
                 let path_clone = path_str.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
-
                 thread::spawn(move || {
-                    let mut inotify = match inotify::Inotify::init() {
-                        Ok(i) => i,
-                        Err(e) => {
-                            let response = RustResponse {
-                                action: "watch".to_string(),
-                                status: "error".to_string(),
-                                message: format!("inotify init error: {}", e),
-                                data: None,
-                            };
-                            if let Ok(json) = serde_json::to_string(&response) {
-                                let _ = sender_clone.send_blocking(format!(
-                                    "if (window.onRunicResponse) window.onRunicResponse({});",
-                                    json
-                                ));
-                            }
-                            return;
-                        }
-                    };
-
-                    match inotify.watches().add(
-                        &path_clone,
-                        inotify::WatchMask::MODIFY
-                            | inotify::WatchMask::CREATE
-                            | inotify::WatchMask::MOVED_TO
-                            | inotify::WatchMask::CLOSE_WRITE,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            let response = RustResponse {
-                                action: "watch".to_string(),
-                                status: "error".to_string(),
-                                message: format!("inotify watch error: {}", e),
-                                data: None,
-                            };
-                            if let Ok(json) = serde_json::to_string(&response) {
-                                let _ = sender_clone.send_blocking(format!(
-                                    "if (window.onRunicResponse) window.onRunicResponse({});",
-                                    json
-                                ));
-                            }
-                            return;
-                        }
-                    };
-
-                    let mut buffer = [0; 1024];
-                    let mut last_event_time = std::time::Instant::now();
-
                     loop {
                         {
-                            let positions = state_clone.watch_positions.lock().unwrap();
+                            let positions = safe_lock(&state_clone.watch_positions);
                             if !positions.contains_key(&path_clone) {
                                 break;
                             }
                         }
-
-                        match inotify.read_events_blocking(&mut buffer) {
-                            Ok(events) => {
-                                let now = std::time::Instant::now();
-                                if now.duration_since(last_event_time).as_millis() < 100 {
+                        if let Ok(mut file) = fs::File::open(&path_clone) {
+                            let meta = match file.metadata() {
+                                Ok(m) => m,
+                                Err(_) => {
+                                    thread::sleep(Duration::from_secs(1));
                                     continue;
                                 }
-                                last_event_time = now;
+                            };
+                            let current_pos = {
+                                let positions = safe_lock(&state_clone.watch_positions);
+                                positions.get(&path_clone).copied().flatten()
+                            };
 
-                                for _event in events {
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                            let file_len = meta.len();
+                            let start_pos = match current_pos {
+                                Some(pos) => {
+                                    if file_len < pos {
+                                        0
+                                    } else {
+                                        pos
+                                    }
+                                }
+                                None => 0,
+                            };
 
-                                    if let Ok(mut file) = fs::File::open(&path_clone) {
-                                        let mut positions =
-                                            state_clone.watch_positions.lock().unwrap();
-
-                                        if let Some(pos) = positions.get_mut(&path_clone) {
-                                            use std::io::{Read, Seek, SeekFrom};
-
-                                            let meta = match fs::metadata(&path_clone) {
-                                                Ok(m) => m,
-                                                Err(_) => continue,
+                            if file.seek(SeekFrom::Start(start_pos)).is_ok() {
+                                let mut content = String::new();
+                                if file.read_to_string(&mut content).is_ok() {
+                                    for line in content.lines() {
+                                        if !line.is_empty() {
+                                            let response = RustResponse {
+                                                action: "watch".to_string(),
+                                                status: "watch_data".to_string(),
+                                                message: path_clone.clone(),
+                                                data: Some(line.to_string()),
                                             };
-
-                                            // КРИТИЧЕСКИ ВАЖНО: Защита от усечения (truncate)
-                                            if meta.len() < *pos {
-                                                *pos = 0;
+                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                let js = format!(
+                                                    "if (window.onRunicResponse) window.onRunicResponse({});",
+                                                    json
+                                                );
+                                                let _ = sender_clone.send_blocking(js);
                                             }
-
-                                            if file.seek(SeekFrom::Start(*pos)).is_err() {
-                                                continue;
-                                            }
-
-                                            let mut content = String::new();
-                                            if file.read_to_string(&mut content).is_err() {
-                                                continue;
-                                            }
-
-                                            for line in content.lines() {
-                                                if !line.is_empty() {
-                                                    let response = RustResponse {
-                                                        action: "watch".to_string(),
-                                                        status: "watch_data".to_string(),
-                                                        message: path_clone.clone(),
-                                                        data: Some(line.to_string()),
-                                                    };
-                                                    if let Ok(json) =
-                                                        serde_json::to_string(&response)
-                                                    {
-                                                        let js = format!(
-                                                            "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                            json
-                                                        );
-                                                        let _ = sender_clone.send_blocking(js);
-                                                    }
-                                                }
-                                            }
-
-                                            *pos = meta.len();
                                         }
                                     }
                                 }
                             }
-                            Err(e) => {
-                                let response = RustResponse {
-                                    action: "watch".to_string(),
-                                    status: "error".to_string(),
-                                    message: format!("inotify read error: {}", e),
-                                    data: None,
-                                };
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender_clone.send_blocking(format!(
-                                        "if (window.onRunicResponse) window.onRunicResponse({});",
-                                        json
-                                    ));
+
+                            let mut positions = safe_lock(&state_clone.watch_positions);
+                            if let Some(pos_opt) = positions.get_mut(&path_clone) {
+                                *pos_opt = Some(file_len);
+                            }
+                        } else {
+                            let mut positions = safe_lock(&state_clone.watch_positions);
+                            if let Some(pos_opt) = positions.get_mut(&path_clone) {
+                                if pos_opt.is_some() {
+                                    *pos_opt = None;
                                 }
-                                break;
                             }
                         }
+
+                        thread::sleep(Duration::from_secs(1));
                     }
-
-                    state_clone
-                        .watch_positions
-                        .lock()
-                        .unwrap()
-                        .remove(&path_clone);
                 });
-
                 send_js("watch", "success", "Мониторинг запущен", None);
             }
         }
         "unwatch" => {
             let path = request.payload.get("path").and_then(|v| v.as_str());
             if let Some(p) = path {
-                let mut positions = state.watch_positions.lock().unwrap();
+                let mut positions = safe_lock(&state.watch_positions);
                 if positions.remove(p).is_some() {
                     send_js("unwatch", "success", "Мониторинг остановлен", None);
                 } else {
@@ -426,7 +399,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
 
 fn main() {
     let args = Args::parse();
-    let html_path = args.html_path.clone();
+    let html_path = match args.html_path {
+        Some(p) => p,
+        None => {
+            use clap::CommandFactory;
+            let _ = Args::command().print_help();
+            println!();
+            std::process::exit(0);
+        }
+    };
     let width = args.width;
     let height = args.height;
     let x = args.x;
@@ -598,31 +579,49 @@ fn main() {
             let html_dir = html_dir.to_path_buf();
             let (reload_sender, reload_receiver) = async_channel::unbounded::<()>();
             let webview_for_reload = webview.clone();
+            let state_for_reload = Arc::clone(&app_state);
+
             glib::spawn_future_local(async move {
                 while let Ok(()) = reload_receiver.recv().await {
                     eprintln!("[Runic Debug] Обнаружены изменения, перезагрузка WebView...");
+                    if let Ok(mut streams) = state_for_reload.running_streams.lock() {
+                        streams.clear();
+                    }
+                    if let Ok(mut positions) = state_for_reload.watch_positions.lock() {
+                        positions.clear();
+                    }
                     webview_for_reload.reload();
                 }
             });
+
             eprintln!(
                 "[Runic Debug] Hot-reload включен для: {}",
                 html_dir.display()
             );
+
             std::thread::spawn(move || {
-                let mut inotify = inotify::Inotify::init().expect("Failed to init inotify");
-                inotify
-                    .watches()
-                    .add(
-                        &html_dir,
-                        inotify::WatchMask::MODIFY
-                            | inotify::WatchMask::CREATE
-                            | inotify::WatchMask::DELETE
-                            | inotify::WatchMask::MOVED_TO
-                            | inotify::WatchMask::CLOSE_WRITE,
-                    )
-                    .expect("Failed to add watch");
-                let mut buffer = [0; 1024];
+                let mut inotify = match inotify::Inotify::init() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("[Runic Debug] Failed to init inotify: {}", e);
+                        return;
+                    }
+                };
+                if let Err(e) = inotify.watches().add(
+                    &html_dir,
+                    inotify::WatchMask::MODIFY
+                        | inotify::WatchMask::CREATE
+                        | inotify::WatchMask::DELETE
+                        | inotify::WatchMask::MOVED_TO
+                        | inotify::WatchMask::CLOSE_WRITE,
+                ) {
+                    eprintln!("[Runic Debug] Failed to add watch: {}", e);
+                    return;
+                }
+
+                let mut buffer = vec![0u8; 64 * 1024];
                 let mut last_reload = Instant::now();
+
                 loop {
                     match inotify.read_events_blocking(&mut buffer) {
                         Ok(events) => {
@@ -651,8 +650,8 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            eprintln!("[Runic Debug] inotify error: {}", e);
-                            break;
+                            eprintln!("[Runic Debug] inotify error: {}. Continuing...", e);
+                            thread::sleep(Duration::from_millis(5000));
                         }
                     }
                 }
@@ -663,6 +662,7 @@ fn main() {
     let state_for_resume = Arc::clone(&app_state);
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
+
     std::thread::spawn(move || {
         let mut last_time = std::time::SystemTime::now();
         loop {
@@ -675,6 +675,9 @@ fn main() {
                     }
                     if let Ok(mut streams) = state_for_resume.running_streams.lock() {
                         streams.clear();
+                    }
+                    if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
+                        positions.clear();
                     }
                     let _ =
                         js_sender_for_resume.send_blocking("window.location.reload();".to_string());
@@ -804,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_action_watch_success() {
+    fn test_handle_action_watch_existing_file() {
         let (state, sender, receiver) = setup_test_state();
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_watch.log");
@@ -820,17 +823,39 @@ mod tests {
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "success");
 
-        let positions = state.watch_positions.lock().unwrap();
+        let positions = safe_lock(&state.watch_positions);
         assert!(positions.contains_key(file_path.to_str().unwrap()));
-
+        assert!(positions[file_path.to_str().unwrap()].is_some());
         drop(positions);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        state
-            .watch_positions
-            .lock()
-            .unwrap()
-            .remove(file_path.to_str().unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_handle_action_watch_nonexistent_file() {
+        let (state, sender, receiver) = setup_test_state();
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join("runic_test_watch_nonexist.log");
+        let _ = std::fs::remove_file(&file_path);
+
+        let request = JsMessage {
+            action: "watch".to_string(),
+            payload: json!({"path": file_path.to_str().unwrap()}),
+        };
+        handle_action(Arc::clone(&state), request, sender);
+
+        let response = get_response(&receiver);
+        assert_eq!(response.action, "watch");
+        assert_eq!(response.status, "success");
+
+        let positions = safe_lock(&state.watch_positions);
+        assert!(positions.contains_key(file_path.to_str().unwrap()));
+        assert!(positions[file_path.to_str().unwrap()].is_none());
+        drop(positions);
+
+        std::thread::sleep(Duration::from_millis(100));
+        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
     }
 
     #[test]
@@ -858,12 +883,8 @@ mod tests {
         assert_eq!(response.status, "error");
         assert_eq!(response.message, "Файл уже мониторится");
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        state
-            .watch_positions
-            .lock()
-            .unwrap()
-            .remove(file_path.to_str().unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -881,7 +902,7 @@ mod tests {
         handle_action(Arc::clone(&state), watch_request, sender.clone());
         let _ = get_response(&receiver);
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
 
         let unwatch_request = JsMessage {
             action: "unwatch".to_string(),
@@ -893,9 +914,8 @@ mod tests {
         assert_eq!(response.action, "unwatch");
         assert_eq!(response.status, "success");
 
-        let positions = state.watch_positions.lock().unwrap();
+        let positions = safe_lock(&state.watch_positions);
         assert!(!positions.contains_key(file_path.to_str().unwrap()));
-
         let _ = std::fs::remove_file(&file_path);
     }
 
