@@ -442,6 +442,10 @@ section:has(.player-state) {
     margin-left: .3ex;
 }
 
+.webcam-state {
+    display: none;
+}
+
 @keyframes spin {
     50% {
         transform: rotateY(90deg);

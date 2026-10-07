@@ -139,6 +139,8 @@ const targetPlayer = () => `
   echo \$! > "\$TARGET_DIR/mpv.pid"
 `;
 
+let timeoutPlayer;
+
 function payerPlayPause(t) {
   if (t)
     radioUrl = urlsPlayer[urlsPlayer.indexOf(radioUrl) + 1] || urlsPlayer[0];
@@ -199,7 +201,7 @@ function updateBattaryHeadsetEnergy(datastate) {
   status.lastElementChild.textContent = status.firstElementChild.textContent =
     "";
 
-  if (datastate) {
+  if (datastate[3]) {
     status.firstElementChild.textContent = datastate[3];
     status.lastElementChild.textContent = datastate[1];
   }
@@ -438,14 +440,14 @@ window.onRunicResponse = function (response) {
     // === WATCH: маршрутизируем через диспетчер ===
     if (response.action === "watch" && response.status === "watch_data") {
       const handler = watchHandlers.get(response.message);
-      if (handler && handler.onData) {
+      if (handler.onData) {
         handler.onData(response.data);
       }
       return;
     }
 
     // === EXEC: обработка результатов команд ===
-    if (response.action === "exec" && response.data) {
+    if (response.action === "exec") {
       const msg = response.message;
 
       if (msg.includes("folders.db") && msg.includes("Inbox")) {
@@ -473,7 +475,7 @@ window.onRunicResponse = function (response) {
     }
 
     // === STREAM: обработка потоков (как в старом скрипте) ===
-    if (response.action === "stream" && response.data) {
+    if (response.action === "stream") {
       if (response.message.includes(targetNet))
         updateNetData(...response.data.split(";"));
       else if (response.message.includes(targetTemp)) {
