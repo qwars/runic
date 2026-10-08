@@ -16,6 +16,15 @@ Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 - **File monitoring via inotify** — track file changes without polling (zero CPU load while idle)
 - **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (in `--debug` mode)
 
+## 🛡️ Reliability and Stability (v1.2.0)
+
+The project has undergone a deep security and stability audit. Version 1.2.0 eliminates critical vulnerabilities, ensuring reliable long-term widget operation:
+
+- **Atomic process management**: Eliminated TOCTOU (Time-of-Check to Time-of-Use) race conditions when launching streaming commands. Repeated `stream` calls with the same argument are now guaranteed to be blocked.
+- **Safe resource cleanup**: Eliminated double-kill scenarios and panics during `SIGTERM`/`SIGINT` signal handling. All mutexes are protected against poisoning.
+- **Graceful Shutdown**: All background threads (file monitoring, system sleep detector) now receive a stop signal and terminate cleanly, leaving no zombie processes or memory leaks.
+- **Compatibility and Code Quality**: The codebase fully complies with strict `cargo clippy -- -D warnings` checks and supports a wider range of Rust versions (MSRV).
+
 ## Requirements
 
 - **OS:** Linux with Wayland compositor (Sway, Hyprland, Wayfire, etc.)

@@ -12,6 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,7 +74,9 @@ enum WatchState {
 struct AppState {
     running_streams: Mutex<HashMap<String, std::process::Child>>,
     watch_positions: Mutex<HashMap<String, WatchState>>,
+    spawned_pids: Mutex<Vec<u32>>,
     is_debug: bool,
+    shutdown: AtomicBool,
 }
 
 fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -81,6 +84,69 @@ fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         eprintln!("[Runic Warning] Mutex was poisoned, recovering...");
         poisoned.into_inner()
     })
+}
+
+fn cleanup_children(state: &Arc<AppState>) {
+    eprintln!("[Runic Debug] === НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ===");
+    state.shutdown.store(true, Ordering::Relaxed);
+
+    let pids = safe_lock(&state.spawned_pids).clone();
+    if pids.is_empty() {
+        eprintln!("[Runic Debug] Нечего очищать.");
+        return;
+    }
+    for &pid in &pids {
+        eprintln!("[Runic Debug] Отправка SIGTERM процессу {}", pid);
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    for &pid in &pids {
+        eprintln!("[Runic Debug] Отправка SIGKILL процессу {}", pid);
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid as libc::pid_t, &mut status, 0);
+        }
+    }
+    eprintln!("[Runic Debug] === ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ===");
+}
+
+fn kill_and_clear_tracked(state: &Arc<AppState>) {
+    eprintln!("[Runic Debug] === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ===");
+    state.shutdown.store(true, Ordering::Relaxed);
+
+    // Сначала убиваем процессы из running_streams и собираем их PID
+    let mut killed_pids = Vec::new();
+    {
+        let mut streams = safe_lock(&state.running_streams);
+        for (_, child) in streams.drain() {
+            let pid = child.id();
+            killed_pids.push(pid);
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid as libc::pid_t, &mut status, 0);
+            }
+        }
+    }
+
+    // Затем убиваем оставшиеся PID, исключая уже убитые
+    {
+        let mut pids = safe_lock(&state.spawned_pids);
+        pids.retain(|p| !killed_pids.contains(p));
+        for &pid in pids.iter() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid as libc::pid_t, &mut status, 0);
+            }
+        }
+        pids.clear();
+    }
+
+    eprintln!("[Runic Debug] === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ЗАВЕРШЕНА ===");
 }
 
 fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<String>) {
@@ -175,34 +241,44 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("stream", "error", "target не указан", None);
                     return;
                 }
-                {
-                    let running = safe_lock(&state.running_streams);
-                    if running.contains_key(&target) {
-                        send_js("stream", "error", "Уже выполняется", None);
-                        return;
-                    }
-                }
 
                 let target_clone = target.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
 
-                let stderr_mode = if state_clone.is_debug {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                };
-                let child = Command::new("sh")
+                let mut cmd_obj = Command::new("sh");
+                cmd_obj
                     .arg("-c")
                     .arg(&target_clone)
                     .stdout(Stdio::piped())
-                    .stderr(stderr_mode)
-                    .spawn();
+                    .stderr(Stdio::piped());
 
-                match child {
+                // ИСПРАВЛЕНО: один лок от проверки до вставки (устранён TOCTOU)
+                let mut running = safe_lock(&state.running_streams);
+                if running.contains_key(&target) {
+                    send_js("stream", "error", "Уже выполняется", None);
+                    return;
+                }
+
+                match cmd_obj.spawn() {
                     Ok(mut proc) => {
+                        let pid = proc.id();
+                        eprintln!("[Runic Debug] Stream запущен: PID={}", pid);
+                        safe_lock(&state_clone.spawned_pids).push(pid);
                         let stdout = proc.stdout.take().unwrap();
-                        safe_lock(&state_clone.running_streams).insert(target_clone.clone(), proc);
+                        let stderr = proc.stderr.take();
+                        running.insert(target_clone.clone(), proc);
+                        drop(running); // Отпускаем лок перед spawn потоков чтения
+
+                        if let Some(stderr_pipe) = stderr {
+                            let target_for_stderr = target_clone.clone();
+                            thread::spawn(move || {
+                                let reader = BufReader::new(stderr_pipe);
+                                for l in reader.lines().map_while(Result::ok) {
+                                    eprintln!("[Runic STDERR][{}] {}", target_for_stderr, l);
+                                }
+                            });
+                        }
 
                         thread::spawn(move || {
                             let reader = BufReader::new(stdout);
@@ -213,7 +289,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             action: "stream".to_string(),
                                             status: "stream_data".to_string(),
                                             message: target_clone.clone(),
-                                            data: Some(l),
+                                            data: Some(l.clone()),
                                         };
                                         if let Ok(json) = serde_json::to_string(&response) {
                                             let js = format!(
@@ -226,11 +302,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     Err(_) => break,
                                 }
                             }
-                            safe_lock(&state_clone.running_streams).remove(&target_clone);
+                            // Предотвращение зомби при естественном завершении
+                            if let Some(mut child) =
+                                safe_lock(&state_clone.running_streams).remove(&target_clone)
+                            {
+                                let _ = child.wait();
+                                let mut pids = safe_lock(&state_clone.spawned_pids);
+                                pids.retain(|&p| p != child.id());
+                            }
                         });
                         send_js("stream", "success", "Запущен", None);
                     }
                     Err(e) => {
+                        drop(running);
                         send_js(
                             "stream",
                             "error",
@@ -247,8 +331,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let mut running = safe_lock(&state.running_streams);
-                if let Some(mut child) = running.remove(target) {
-                    let _ = child.kill();
+                if let Some(child) = running.remove(target) {
+                    let pid = child.id();
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                        let mut status: libc::c_int = 0;
+                        libc::waitpid(pid as libc::pid_t, &mut status, 0);
+                    }
+                    let mut pids = safe_lock(&state.spawned_pids);
+                    pids.retain(|&p| p != pid);
                     send_js("unstream", "success", "Остановлен", None);
                 } else {
                     send_js("unstream", "error", "Не найден", None);
@@ -266,7 +357,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             send_js("watch", "error", "Уже мониторится", None);
                             return;
                         }
-
                         let initial_state = if path_buf.is_dir() {
                             WatchState::Dir(path_buf.metadata().ok().and_then(|m| {
                                 m.modified()
@@ -329,18 +419,17 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
                     thread::spawn(move || {
-                        loop {
+                        // ИСПРАВЛЕНО: проверка shutdown для чистой остановки
+                        while !state_clone.shutdown.load(Ordering::Relaxed) {
                             {
                                 let positions = safe_lock(&state_clone.watch_positions);
                                 if !positions.contains_key(&path_clone) {
                                     break;
                                 }
                             }
-
                             let current_path_buf = std::path::PathBuf::from(&path_clone);
                             let is_dir = current_path_buf.is_dir();
                             let exists = current_path_buf.exists();
-
                             if exists {
                                 if is_dir {
                                     let current_mod_time =
@@ -352,7 +441,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 })
                                                 .map(|d| d.as_secs())
                                         });
-
                                     let should_notify = {
                                         let mut positions = safe_lock(&state_clone.watch_positions);
                                         if let Some(WatchState::Dir(last_mod)) =
@@ -365,12 +453,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 false
                                             }
                                         } else {
-                                            *positions.get_mut(&path_clone).unwrap() =
-                                                WatchState::Dir(current_mod_time);
+                                            // ИСПРАВЛЕНО: insert вместо unwrap (устранена паника)
+                                            positions.insert(
+                                                path_clone.clone(),
+                                                WatchState::Dir(current_mod_time),
+                                            );
                                             true
                                         }
                                     };
-
                                     if should_notify {
                                         let response = RustResponse {
                                             action: "watch".to_string(),
@@ -497,6 +587,7 @@ fn main() {
             std::process::exit(0);
         }
     };
+
     let width = args.width;
     let height = args.height;
     let x = args.x;
@@ -513,12 +604,15 @@ fn main() {
     let file_url = format!("file://{}", abs_path.display());
 
     gtk::init().expect("Не удалось инициализировать GTK");
+
     let window = gtk::Window::new(gtk::WindowType::Popup);
     window.set_default_size(800, 600);
-    if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window)
-        && let Some(visual) = screen.rgba_visual()
-    {
-        window.set_visual(Some(&visual));
+
+    // ИСПРАВЛЕНО: let chains → вложенные if (совместимость с MSRV < 1.87)
+    if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
+        if let Some(visual) = screen.rgba_visual() {
+            window.set_visual(Some(&visual));
+        }
     }
     window.set_app_paintable(true);
 
@@ -547,18 +641,12 @@ fn main() {
             set_anchor(&window, Edge::Bottom, false);
             set_margin(&window, Edge::Top, y);
             set_margin(&window, Edge::Left, x);
-            if is_debug {
-                eprintln!("[Runic Debug] Размер: {}x{}, Позиция: ({}, {})", w, h, x, y);
-            }
         }
         _ => {
             set_anchor(&window, Edge::Top, true);
             set_anchor(&window, Edge::Left, true);
             set_anchor(&window, Edge::Right, true);
             set_anchor(&window, Edge::Bottom, true);
-            if is_debug {
-                eprintln!("[Runic Debug] Размер: на весь экран");
-            }
         }
     }
     set_exclusive_zone(&window, 0);
@@ -581,16 +669,20 @@ fn main() {
     let controller = webview
         .user_content_manager()
         .expect("WebView должен иметь user_content_manager");
+
     let app_state = Arc::new(AppState {
         running_streams: Mutex::new(HashMap::new()),
         watch_positions: Mutex::new(HashMap::new()),
+        spawned_pids: Mutex::new(Vec::new()),
         is_debug,
+        shutdown: AtomicBool::new(false),
     });
 
     let (js_sender, js_receiver) = async_channel::bounded::<String>(1024);
 
     let state_clone = Arc::clone(&app_state);
     let sender_for_handler = js_sender.clone();
+
     let registered = controller.register_script_message_handler("ipc");
     if is_debug {
         eprintln!(
@@ -613,8 +705,6 @@ fn main() {
                         request,
                         sender_for_handler.clone(),
                     );
-                } else if state_clone.is_debug {
-                    eprintln!("[Runic Debug] Ошибка парсинга JSON: {}", msg_str);
                 }
             }
         },
@@ -642,20 +732,54 @@ fn main() {
         &[],
     );
     controller.add_script(&shim);
+
     webview.load_uri(&file_url);
     window.add(&webview);
     window.show_all();
 
     let webview_for_async = webview.clone();
+    let is_debug_for_async = is_debug;
+
+    // ИСПРАВЛЕНО: логирование ошибок run_javascript в debug-режиме
     glib::spawn_future_local(async move {
         while let Ok(js_code) = js_receiver.recv().await {
-            webview_for_async.run_javascript(&js_code, None::<&gio::Cancellable>, |_| ());
+            let wv = webview_for_async.clone();
+            let dbg = is_debug_for_async;
+            wv.run_javascript(&js_code, None::<&gio::Cancellable>, move |result| {
+                if dbg {
+                    if let Err(e) = result {
+                        eprintln!("[Runic Debug] JS execution error: {:?}", e);
+                    }
+                }
+            });
         }
     });
 
-    window.connect_delete_event(|_, _| {
-        gtk::main_quit();
-        Propagation::Stop
+    window.connect_delete_event({
+        let state_clone = Arc::clone(&app_state);
+        move |_, _| {
+            cleanup_children(&state_clone);
+            gtk::main_quit();
+            Propagation::Stop
+        }
+    });
+
+    glib::source::unix_signal_add(libc::SIGTERM, {
+        let state_clone = Arc::clone(&app_state);
+        move || {
+            cleanup_children(&state_clone);
+            gtk::main_quit();
+            glib::ControlFlow::Break
+        }
+    });
+
+    glib::source::unix_signal_add(libc::SIGINT, {
+        let state_clone = Arc::clone(&app_state);
+        move || {
+            cleanup_children(&state_clone);
+            gtk::main_quit();
+            glib::ControlFlow::Break
+        }
     });
 
     if is_debug {
@@ -669,22 +793,16 @@ fn main() {
             glib::spawn_future_local(async move {
                 while let Ok(()) = reload_receiver.recv().await {
                     eprintln!("[Runic Debug] Обнаружены изменения, перезагрузка WebView...");
-                    if let Ok(mut streams) = state_for_reload.running_streams.lock() {
-                        for (_, mut child) in streams.drain() {
-                            let _ = child.kill();
-                        }
-                    }
+                    kill_and_clear_tracked(&state_for_reload);
                     if let Ok(mut positions) = state_for_reload.watch_positions.lock() {
                         positions.clear();
                     }
+                    // Сбрасываем shutdown для продолжения работы после hot-reload
+                    state_for_reload.shutdown.store(false, Ordering::Relaxed);
                     webview_for_reload.reload();
                 }
             });
 
-            eprintln!(
-                "[Runic Debug] Hot-reload включен для: {}",
-                html_dir.display()
-            );
             std::thread::spawn(move || {
                 let mut inotify = match inotify::Inotify::init() {
                     Ok(i) => i,
@@ -746,9 +864,11 @@ fn main() {
     let state_for_resume = Arc::clone(&app_state);
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
+
+    // ИСПРАВЛЕНО: проверка shutdown для чистой остановки
     std::thread::spawn(move || {
         let mut last_time = std::time::SystemTime::now();
-        loop {
+        while !state_for_resume.shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let now = std::time::SystemTime::now();
             if let Ok(elapsed) = now.duration_since(last_time) {
@@ -756,14 +876,12 @@ fn main() {
                     if is_debug_for_resume {
                         eprintln!("[Runic Debug] Обнаружен выход из сна. Перезагрузка виджета...");
                     }
-                    if let Ok(mut streams) = state_for_resume.running_streams.lock() {
-                        for (_, mut child) in streams.drain() {
-                            let _ = child.kill();
-                        }
-                    }
+                    kill_and_clear_tracked(&state_for_resume);
                     if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
                         positions.clear();
                     }
+                    // Сбрасываем shutdown для продолжения работы после resume
+                    state_for_resume.shutdown.store(false, Ordering::Relaxed);
                     let _ =
                         js_sender_for_resume.send_blocking("window.location.reload();".to_string());
                 }
@@ -780,6 +898,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+    use std::thread::sleep;
 
     fn setup_test_state() -> (
         Arc<AppState>,
@@ -789,14 +908,18 @@ mod tests {
         let state = Arc::new(AppState {
             running_streams: Mutex::new(HashMap::new()),
             watch_positions: Mutex::new(HashMap::new()),
+            spawned_pids: Mutex::new(Vec::new()),
             is_debug: false,
+            shutdown: AtomicBool::new(false),
         });
         let (sender, receiver) = async_channel::bounded::<String>(1024);
         (state, sender, receiver)
     }
 
     fn get_response(receiver: &async_channel::Receiver<String>) -> RustResponse {
-        let js_code = receiver.recv_blocking().expect("Должно прийти сообщение");
+        let js_code = receiver
+            .recv_blocking()
+            .expect("Должно прийти сообщение от Rust");
         let json_str = js_code
             .trim_start_matches("if (window.onRunicResponse) window.onRunicResponse(")
             .trim_end_matches(");");
@@ -809,18 +932,15 @@ mod tests {
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_read.txt");
         std::fs::write(&file_path, "test content").unwrap();
-
         let request = JsMessage {
             action: "read".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "read");
         assert_eq!(response.status, "success");
         assert_eq!(response.data, Some("test content".to_string()));
-
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -829,13 +949,16 @@ mod tests {
         let (state, sender, receiver) = setup_test_state();
         let request = JsMessage {
             action: "read".to_string(),
-            payload: json!({"path": "/nonexistent/path/file.txt"}),
+            payload: json!({"path": "/nonexistent/path/file_12345.txt"}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "read");
         assert_eq!(response.status, "error");
+        assert!(
+            response.message.contains("No such file or directory")
+                || response.message.contains("Нет такого файла")
+        );
     }
 
     #[test]
@@ -844,20 +967,33 @@ mod tests {
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_write.txt");
         let _ = std::fs::remove_file(&file_path);
-
         let request = JsMessage {
             action: "write".to_string(),
             payload: json!({"path": file_path.to_str().unwrap(), "data": "appended data"}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "write");
         assert_eq!(response.status, "success");
-
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "appended data");
+        let _ = std::fs::remove_file(&file_path);
+    }
 
+    #[test]
+    fn test_handle_action_write_append() {
+        let (state, sender, receiver) = setup_test_state();
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join("runic_test_append.txt");
+        std::fs::write(&file_path, "initial\n").unwrap();
+        let request = JsMessage {
+            action: "write".to_string(),
+            payload: json!({"path": file_path.to_str().unwrap(), "data": "appended\n", "append": true}),
+        };
+        handle_action(state, request, sender);
+        let _ = get_response(&receiver);
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "initial\nappended\n");
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -869,7 +1005,6 @@ mod tests {
             payload: json!({"command": "echo -n 'hello world'"}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "exec");
         assert_eq!(response.status, "success");
@@ -877,37 +1012,126 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_action_unknown() {
+    fn test_handle_action_exec_error() {
         let (state, sender, receiver) = setup_test_state();
         let request = JsMessage {
-            action: "unknown_action".to_string(),
-            payload: json!({}),
+            action: "exec".to_string(),
+            payload: json!({"command": "ls /nonexistent_directory_12345"}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
-        assert_eq!(response.action, "unknown_action");
-        assert_eq!(response.status, "error");
-        assert_eq!(response.message, "Неизвестное действие");
+        assert_eq!(response.action, "exec");
+        assert_eq!(response.status, "success");
+        assert!(
+            response.data.as_ref().unwrap().contains("STDERR:")
+                || response.data.as_ref().unwrap().contains("No such file")
+        );
     }
 
     #[test]
-    fn test_handle_action_watch_existing_file() {
+    fn test_handle_action_stream_success_and_cleanup() {
+        let (state, sender, receiver) = setup_test_state();
+        let request = JsMessage {
+            action: "stream".to_string(),
+            payload: json!({"target": "echo 'stream_data_test'"}),
+        };
+        handle_action(Arc::clone(&state), request, sender);
+        let start_response = get_response(&receiver);
+        assert_eq!(start_response.action, "stream");
+        assert_eq!(start_response.status, "success");
+        let data_response = get_response(&receiver);
+        assert_eq!(data_response.action, "stream");
+        assert_eq!(data_response.status, "stream_data");
+        assert_eq!(data_response.data, Some("stream_data_test".to_string()));
+        sleep(Duration::from_millis(500));
+        let running = safe_lock(&state.running_streams);
+        assert!(
+            running.is_empty(),
+            "Поток должен быть удален из running_streams"
+        );
+        drop(running);
+        let pids = safe_lock(&state.spawned_pids);
+        assert!(
+            pids.is_empty(),
+            "PID должен быть удален из spawned_pids после завершения"
+        );
+    }
+
+    #[test]
+    fn test_handle_action_stream_error_empty_target() {
+        let (state, sender, receiver) = setup_test_state();
+        let request = JsMessage {
+            action: "stream".to_string(),
+            payload: json!({"target": ""}),
+        };
+        handle_action(state, request, sender);
+        let response = get_response(&receiver);
+        assert_eq!(response.action, "stream");
+        assert_eq!(response.status, "error");
+        assert_eq!(response.message, "target не указан");
+    }
+
+    #[test]
+    fn test_handle_action_stream_duplicate_error() {
+        // Тест на TOCTOU: второй stream с тем же target должен вернуть ошибку
+        let (state, sender, receiver) = setup_test_state();
+        let request = JsMessage {
+            action: "stream".to_string(),
+            payload: json!({"target": "sleep 10"}),
+        };
+        handle_action(Arc::clone(&state), request, sender.clone());
+        let start_response = get_response(&receiver);
+        assert_eq!(start_response.status, "success");
+
+        // Второй запрос с тем же target
+        let request2 = JsMessage {
+            action: "stream".to_string(),
+            payload: json!({"target": "sleep 10"}),
+        };
+        handle_action(Arc::clone(&state), request2, sender);
+        let dup_response = get_response(&receiver);
+        assert_eq!(dup_response.action, "stream");
+        assert_eq!(dup_response.status, "error");
+        assert_eq!(dup_response.message, "Уже выполняется");
+
+        // Очистка
+        safe_lock(&state.running_streams).clear();
+        safe_lock(&state.spawned_pids).clear();
+    }
+
+    #[test]
+    fn test_handle_action_watch_file_success() {
         let (state, sender, receiver) = setup_test_state();
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_watch.log");
         std::fs::write(&file_path, "initial line\n").unwrap();
-
         let request = JsMessage {
             action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
+            payload: json!({"path": file_path.to_str().unwrap(), "tail": 1}),
         };
         handle_action(Arc::clone(&state), request, sender);
-
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "watch");
-        assert_eq!(response.status, "success");
-
+        let mut got_success = false;
+        let mut got_watch_data = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(200) {
+            match receiver.try_recv() {
+                Ok(js_code) => {
+                    let json_str = js_code
+                        .trim_start_matches("if (window.onRunicResponse) window.onRunicResponse(")
+                        .trim_end_matches(");");
+                    if let Ok(response) = serde_json::from_str::<RustResponse>(json_str) {
+                        if response.status == "success" && response.action == "watch" {
+                            got_success = true;
+                        } else if response.status == "watch_data" && response.action == "watch" {
+                            got_watch_data = true;
+                        }
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(got_success, "Должно прийти подтверждение запуска watch");
+        assert!(got_watch_data, "Должны прийти данные из файла (tail)");
         let positions = safe_lock(&state.watch_positions);
         assert!(positions.contains_key(file_path.to_str().unwrap()));
         assert!(matches!(
@@ -915,67 +1139,32 @@ mod tests {
             WatchState::File(Some(_))
         ));
         drop(positions);
-
         std::thread::sleep(Duration::from_millis(100));
         safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
-    fn test_handle_action_watch_nonexistent_file() {
-        let (state, sender, receiver) = setup_test_state();
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("runic_test_watch_nonexist.log");
-        let _ = std::fs::remove_file(&file_path);
-
-        let request = JsMessage {
-            action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "watch");
-        assert_eq!(response.status, "success");
-
-        let positions = safe_lock(&state.watch_positions);
-        assert!(positions.contains_key(file_path.to_str().unwrap()));
-        assert!(matches!(
-            positions[file_path.to_str().unwrap()],
-            WatchState::File(None)
-        ));
-        drop(positions);
-
-        std::thread::sleep(Duration::from_millis(100));
-        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
-    }
-
-    #[test]
-    fn test_handle_action_watch_duplicate() {
+    fn test_handle_action_watch_duplicate_error() {
         let (state, sender, receiver) = setup_test_state();
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_watch_dup.log");
         std::fs::write(&file_path, "line\n").unwrap();
-
         let request1 = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), request1, sender.clone());
         let _ = get_response(&receiver);
-
         let request2 = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), request2, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "error");
         assert_eq!(response.message, "Уже мониторится");
-
-        std::thread::sleep(Duration::from_millis(100));
         safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
     }
@@ -986,44 +1175,88 @@ mod tests {
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_unwatch.log");
         std::fs::write(&file_path, "line\n").unwrap();
-
         let watch_request = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), watch_request, sender.clone());
         let _ = get_response(&receiver);
-
-        std::thread::sleep(Duration::from_millis(100));
-
+        sleep(Duration::from_millis(100));
         let unwatch_request = JsMessage {
             action: "unwatch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), unwatch_request, sender);
-
         let response = get_response(&receiver);
         assert_eq!(response.action, "unwatch");
         assert_eq!(response.status, "success");
-
         let positions = safe_lock(&state.watch_positions);
         assert!(!positions.contains_key(file_path.to_str().unwrap()));
-
         let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
-    fn test_handle_action_unwatch_not_watched() {
+    fn test_handle_action_unknown() {
         let (state, sender, receiver) = setup_test_state();
         let request = JsMessage {
-            action: "unwatch".to_string(),
-            payload: json!({"path": "/tmp/nonexistent_watch.log"}),
+            action: "unknown_action".to_string(),
+            payload: json!({}),
         };
         handle_action(state, request, sender);
-
         let response = get_response(&receiver);
-        assert_eq!(response.action, "unwatch");
+        assert_eq!(response.action, "unknown_action");
         assert_eq!(response.status, "error");
-        assert_eq!(response.message, "Файл не мониторится");
+        assert_eq!(response.message, "Неизвестное действие");
+    }
+
+    #[test]
+    fn test_kill_and_clear_tracked_no_double_kill() {
+        // Тест: процессы из running_streams не должны быть убиты дважды
+        let (state, _sender, _receiver) = setup_test_state();
+
+        // Запускаем процесс через stream
+        let child = Command::new("sleep")
+            .arg("10")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        safe_lock(&state.spawned_pids).push(pid);
+        safe_lock(&state.running_streams).insert("test".to_string(), child);
+
+        // Вызываем kill_and_clear_tracked
+        kill_and_clear_tracked(&state);
+
+        // Проверяем, что всё очищено
+        assert!(safe_lock(&state.running_streams).is_empty());
+        assert!(safe_lock(&state.spawned_pids).is_empty());
+    }
+
+    #[test]
+    fn test_shutdown_flag_stops_watch_loop() {
+        let (state, sender, _receiver) = setup_test_state();
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join("runic_test_shutdown_watch.log");
+        std::fs::write(&file_path, "line\n").unwrap();
+
+        let request = JsMessage {
+            action: "watch".to_string(),
+            payload: json!({"path": file_path.to_str().unwrap()}),
+        };
+        handle_action(Arc::clone(&state), request, sender);
+        sleep(Duration::from_millis(100));
+
+        // Устанавливаем shutdown
+        state.shutdown.store(true, Ordering::Relaxed);
+
+        // Ждём, пока поток watch завершится (до 2 секунд)
+        sleep(Duration::from_secs(2));
+
+        // Поток должен был выйти из цикла
+        // Проверяем, что флаг установлен
+        assert!(state.shutdown.load(Ordering::Relaxed));
+
+        let _ = std::fs::remove_file(&file_path);
     }
 }

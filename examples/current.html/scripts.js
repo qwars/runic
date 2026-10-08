@@ -361,10 +361,10 @@ done`;
 // ПОГОДА: 3600с
 const targetWeatherStatus = `while true; do
   DATA=$(curl -s -m 3 'wttr.in/?format=1&lang=ru')
-  if [ -n "$DATA" ] && [ "$DATA" != "Unknown location;" ]; then 
+  if [ -n "$DATA" ] && [ "$DATA" != "Unknown location;" ]; then
     echo "$DATA"
     sleep 3600
-  else 
+  else
     sleep 10
   fi
 done`;
