@@ -297,7 +297,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             let _ = file.seek(SeekFrom::End(-(read_size as i64)));
                                             let reader = BufReader::new(file);
                                             let lines: Vec<String> =
-                                                reader.lines().filter_map(Result::ok).collect();
+                                                reader.lines().map_while(Result::ok).collect();
                                             let start = if lines.len() > n as usize {
                                                 lines.len() - n as usize
                                             } else {
@@ -418,24 +418,22 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         };
                                         if file.seek(SeekFrom::Start(start_pos)).is_ok() {
                                             let reader = BufReader::new(file);
-                                            for line in reader.lines() {
-                                                if let Ok(l) = line {
-                                                    if !l.is_empty() {
-                                                        let response = RustResponse {
-                                                            action: "watch".to_string(),
-                                                            status: "watch_data".to_string(),
-                                                            message: path_clone.clone(),
-                                                            data: Some(l),
-                                                        };
-                                                        if let Ok(json) =
-                                                            serde_json::to_string(&response)
-                                                        {
-                                                            let js = format!(
-                                                                "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                                json
-                                                            );
-                                                            let _ = sender_clone.send_blocking(js);
-                                                        }
+                                            for l in reader.lines().map_while(Result::ok) {
+                                                if !l.is_empty() {
+                                                    let response = RustResponse {
+                                                        action: "watch".to_string(),
+                                                        status: "watch_data".to_string(),
+                                                        message: path_clone.clone(),
+                                                        data: Some(l),
+                                                    };
+                                                    if let Ok(json) =
+                                                        serde_json::to_string(&response)
+                                                    {
+                                                        let js = format!(
+                                                            "if (window.onRunicResponse) window.onRunicResponse({});",
+                                                            json
+                                                        );
+                                                        let _ = sender_clone.send_blocking(js);
                                                     }
                                                 }
                                             }
@@ -912,7 +910,10 @@ mod tests {
 
         let positions = safe_lock(&state.watch_positions);
         assert!(positions.contains_key(file_path.to_str().unwrap()));
-        assert!(positions[file_path.to_str().unwrap()].is_some());
+        assert!(matches!(
+            positions[file_path.to_str().unwrap()],
+            WatchState::File(Some(_))
+        ));
         drop(positions);
 
         std::thread::sleep(Duration::from_millis(100));
@@ -939,7 +940,10 @@ mod tests {
 
         let positions = safe_lock(&state.watch_positions);
         assert!(positions.contains_key(file_path.to_str().unwrap()));
-        assert!(positions[file_path.to_str().unwrap()].is_none());
+        assert!(matches!(
+            positions[file_path.to_str().unwrap()],
+            WatchState::File(None)
+        ));
         drop(positions);
 
         std::thread::sleep(Duration::from_millis(100));
@@ -969,7 +973,7 @@ mod tests {
         let response = get_response(&receiver);
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "error");
-        assert_eq!(response.message, "Файл уже мониторится");
+        assert_eq!(response.message, "Уже мониторится");
 
         std::thread::sleep(Duration::from_millis(100));
         safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
