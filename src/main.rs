@@ -33,14 +33,13 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_STATS_BATCH: u64 = 10;
 const WATCH_STATS_BATCH: u64 = 5;
 const TAIL_BUF_LIMIT: u64 = 64 * 1024;
-
-const RESET: &str = "\x1b[0m";
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const MAGENTA: &str = "\x1b[35m";
-const CYAN: &str = "\x1b[36m";
-const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m ";
+const RED: &str = "\x1b[31m ";
+const GREEN: &str = "\x1b[32m ";
+const YELLOW: &str = "\x1b[33m ";
+const MAGENTA: &str = "\x1b[35m ";
+const CYAN: &str = "\x1b[36m ";
+const BOLD: &str = "\x1b[1m ";
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
@@ -54,6 +53,7 @@ impl ThreadPool {
         let (sender, receiver) = std::sync::mpsc::channel::<Task>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
+
         for _ in 0..size {
             let receiver = Arc::clone(&receiver);
             workers.push(thread::spawn(move || {
@@ -62,6 +62,7 @@ impl ThreadPool {
                 }
             }));
         }
+
         Self {
             sender,
             _workers: workers,
@@ -74,33 +75,33 @@ impl ThreadPool {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "runic", about = "HTML-виджет для рабочего стола")]
+#[command(name = "runic ", about = "HTML-виджет для рабочего стола ")]
 struct Args {
-    #[arg(short = 'w', long, help = "Ширина окна виджета (в пикселях)")]
+    #[arg(short = 'w', long, help = "Ширина окна виджета (в пикселях) ")]
     width: Option<i32>,
-    #[arg(short = 'H', long, help = "Высота окна виджета (в пикселях)")]
+    #[arg(short = 'H', long, help = "Высота окна виджета (в пикселях) ")]
     height: Option<i32>,
     #[arg(
         short = 'x',
         long,
         default_value = "0",
-        help = "Отступ от левого края экрана"
+        help = "Отступ от левого края экрана "
     )]
     x: i32,
     #[arg(
         short = 'y',
         long,
         default_value = "0",
-        help = "Отступ от верхнего края экрана"
+        help = "Отступ от верхнего края экрана "
     )]
     y: i32,
     #[arg(
         short = 'd',
         long,
-        help = "Включить режим отладки (hot-reload, вывод в консоль)"
+        help = "Включить режим отладки (hot-reload, вывод в консоль) "
     )]
     debug: bool,
-    #[arg(help = "Путь к HTML-файлу виджета", value_name = "FILE")]
+    #[arg(help = "Путь к HTML-файлу виджета ", value_name = "FILE ")]
     html_path: Option<String>,
 }
 
@@ -200,13 +201,11 @@ impl ThreadTracker {
         let finished = threads.values().filter(|t| t.finished_at.is_some()).count();
         let total_created = self.total_created.load(Ordering::Relaxed);
         let total_finished = self.total_finished.load(Ordering::Relaxed);
-
         let mut summary = format!("{}=== СТАТИСТИКА ПОТОКОВ ==={}\n", BOLD, RESET);
         summary += &format!("Создано всего: {}\n", total_created);
         summary += &format!("Завершено: {}\n", total_finished);
         summary += &format!("Активных: {}\n", active);
         summary += &format!("Завершённых в истории: {}\n\n", finished);
-
         if active > 0 {
             summary += &format!("{}Активные потоки:{}\n", GREEN, RESET);
             for stats in threads.values().filter(|t| t.finished_at.is_none()) {
@@ -219,7 +218,6 @@ impl ThreadTracker {
                 );
             }
         }
-
         summary += &format!("\n{}Последние 5 завершённых:{}\n", YELLOW, RESET);
         let mut finished_threads: Vec<_> = threads
             .values()
@@ -272,7 +270,6 @@ struct ResourceStats {
 fn get_resource_stats() -> ResourceStats {
     let mut memory_kb = 0;
     let mut cpu_time_ms = 0;
-
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("VmRSS:") {
@@ -283,7 +280,6 @@ fn get_resource_stats() -> ResourceStats {
             }
         }
     }
-
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
         let user_ms =
@@ -292,7 +288,6 @@ fn get_resource_stats() -> ResourceStats {
             (usage.ru_stime.tv_sec as u128 * 1000) + (usage.ru_stime.tv_usec as u128 / 1000);
         cpu_time_ms = user_ms + sys_ms;
     }
-
     ResourceStats {
         memory_kb,
         cpu_time_ms,
@@ -311,7 +306,7 @@ fn log_profile(action: &str, duration: Duration, stats: &ResourceStats) {
 fn cleanup_children(state: &Arc<AppState>) {
     if state.is_debug {
         eprintln!(
-            "{}[Руник ОТЛАДКА]{} {}=== НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ==={}",
+            "{}[Руник ОТЛАДКА]{} {}=== НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ==={} ",
             CYAN, RESET, BOLD, RESET
         );
     }
@@ -322,14 +317,14 @@ fn cleanup_children(state: &Arc<AppState>) {
     };
     if pids.is_empty() {
         if state.is_debug {
-            eprintln!("{}[Руник ОТЛАДКА]{} Нечего очищать.", CYAN, RESET);
+            eprintln!("{}[Руник ОТЛАДКА]{} Нечего очищать. ", CYAN, RESET);
         }
         return;
     }
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM группе процессов -{}",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM группе процессов -{} ",
                 CYAN, RESET, pid
             );
         }
@@ -343,7 +338,7 @@ fn cleanup_children(state: &Arc<AppState>) {
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL группе процессов -{}",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL группе процессов -{} ",
                 CYAN, RESET, pid
             );
         }
@@ -357,7 +352,7 @@ fn cleanup_children(state: &Arc<AppState>) {
     }
     if state.is_debug {
         eprintln!(
-            "{}[Руник ОТЛАДКА]{} {}=== ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ==={}",
+            "{}[Руник ОТЛАДКА]{} {}=== ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ==={} ",
             CYAN, RESET, BOLD, RESET
         );
     }
@@ -423,7 +418,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
         None
     };
     let pool = Arc::clone(&state.pool);
-
     pool.execute(move || {
         let send_js = |action: &str, status: &str, message: &str, data: Option<String>| {
             let response = RustResponse {
@@ -444,19 +438,57 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
         match request.action.as_str() {
             "read" => {
                 if let Some(path) = request.payload.get("path").and_then(|v| v.as_str()) {
+                    let action_start = Instant::now();
                     match fs::read_to_string(path) {
-                        Ok(content) => send_js("read", "success", "OK", Some(content)),
-                        Err(e) => send_js("read", "error", &format!("{}", e), None),
+                        Ok(content) => {
+                            if is_debug {
+                                let preview: String = content.chars().take(100).collect();
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} read '{}' => OK, {} байт, {:?}, содержимое: '{}{}'",
+                                    GREEN, RESET, path, content.len(), action_start.elapsed(),
+                                    preview, if content.len() > 100 { "..." } else { "" }
+                                );
+                            }
+                            send_js("read", "success", "OK", Some(content));
+                        }
+                        Err(e) => {
+                            if is_debug {
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} read '{}' => ОШИБКА: {}",
+                                    RED, RESET, path, e
+                                );
+                            }
+                            send_js("read", "error", &format!("{}", e), None);
+                        }
                     }
+                } else if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} read => не указан путь",
+                        YELLOW, RESET
+                    );
                 }
             }
+
             "write" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 let data = request.payload.get("data").and_then(|v| v.as_str());
                 if let (Some(p), Some(d)) = (path, data) {
+                    let action_start = Instant::now();
                     let path = Path::new(p);
+                    let append = request
+                        .payload
+                        .get("append")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
                     if let Some(parent) = path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
+                            if is_debug {
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА create_dir_all: {}",
+                                    RED, RESET, p, e
+                                );
+                            }
                             return send_js(
                                 "write",
                                 "error",
@@ -465,11 +497,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             );
                         }
                     }
-                    let append = request
-                        .payload
-                        .get("append")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+
                     match OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -479,14 +507,45 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     {
                         Ok(mut file) => {
                             match file.write_all(d.as_bytes()).and_then(|_| file.flush()) {
-                                Ok(_) => send_js("write", "success", "OK", None),
-                                Err(e) => send_js("write", "error", &format!("{}", e), None),
+                                Ok(_) => {
+                                    if is_debug {
+                                        let mode = if append { "добавление" } else { "перезапись" };
+                                        eprintln!(
+                                            "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => OK, {} байт, режим: {}, {:?}",
+                                            GREEN, RESET, p, d.len(), mode, action_start.elapsed()
+                                        );
+                                    }
+                                    send_js("write", "success", "OK", None);
+                                }
+                                Err(e) => {
+                                    if is_debug {
+                                        eprintln!(
+                                            "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА записи: {}",
+                                            RED, RESET, p, e
+                                        );
+                                    }
+                                    send_js("write", "error", &format!("{}", e), None);
+                                }
                             }
                         }
-                        Err(e) => send_js("write", "error", &format!("{}", e), None),
+                        Err(e) => {
+                            if is_debug {
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА открытия: {}",
+                                    RED, RESET, p, e
+                                );
+                            }
+                            send_js("write", "error", &format!("{}", e), None);
+                        }
                     }
+                } else if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} write => не указан путь или данные",
+                        YELLOW, RESET
+                    );
                 }
             }
+
             "exec" => {
                 if let Some(cmd) = request.payload.get("command").and_then(|v| v.as_str()) {
                     let exec_start = Instant::now();
@@ -498,12 +557,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             Ok(())
                         });
                     }
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} exec запуск: '{}'",
+                            CYAN, RESET, cmd
+                        );
+                    }
                     match cmd_obj.output() {
                         Ok(out) => {
-                            if is_debug {
-                                let exec_stats = get_resource_stats();
-                                log_profile("exec", exec_start.elapsed(), &exec_stats);
-                            }
                             let stdout = String::from_utf8(out.stdout).unwrap_or_else(|e| {
                                 String::from_utf8_lossy(e.as_bytes()).into_owned()
                             });
@@ -511,16 +572,45 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 String::from_utf8_lossy(e.as_bytes()).into_owned()
                             });
                             let result = if out.status.success() {
-                                stdout
+                                stdout.clone()
                             } else {
                                 format!("STDERR:\n{}", stderr)
                             };
+
+                            if is_debug {
+                                let exec_stats = get_resource_stats();
+                                let preview: String = result.chars().take(200).collect();
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} exec '{}' => код выхода: {:?}, {:?}, вывод: '{}{}'",
+                                    GREEN, RESET, cmd,
+                                    out.status.code(),
+                                    exec_start.elapsed(),
+                                    preview,
+                                    if result.len() > 200 { "..." } else { "" }
+                                );
+                                log_profile("exec", exec_start.elapsed(), &exec_stats);
+                            }
+
                             send_js("exec", "success", &("OK: ".to_owned() + cmd), Some(result));
                         }
-                        Err(e) => send_js("exec", "error", &format!("{}", e), None),
+                        Err(e) => {
+                            if is_debug {
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} exec '{}' => ОШИБКА запуска: {}",
+                                    RED, RESET, cmd, e
+                                );
+                            }
+                            send_js("exec", "error", &format!("{}", e), None);
+                        }
                     }
+                } else if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} exec => не указана команда",
+                        YELLOW, RESET
+                    );
                 }
             }
+
             "stream" => {
                 let target = request
                     .payload
@@ -528,10 +618,18 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+
                 if target.is_empty() {
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} stream => не указан target",
+                            YELLOW, RESET
+                        );
+                    }
                     send_js("stream", "error", "target не указан", None);
                     return;
                 }
+
                 let target_clone = target.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
@@ -547,11 +645,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         Ok(())
                     });
                 }
+
                 let mut running = safe_lock(&state.running_streams);
                 if running.contains_key(&target) {
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => уже выполняется",
+                            YELLOW, RESET, target
+                        );
+                    }
                     send_js("stream", "error", "Уже выполняется", None);
                     return;
                 }
+
                 match cmd_obj.spawn() {
                     Ok(mut proc) => {
                         let pid = proc.id();
@@ -561,10 +667,11 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         );
                         if state_clone.is_debug {
                             eprintln!(
-                                "{}[Руник ОТЛАДКА]{} Stream запущен: PID={} [Поток #{}]",
-                                GREEN, RESET, pid, thread_id
+                                "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => запущен, PID={} [Поток #{}]",
+                                GREEN, RESET, target_clone, pid, thread_id
                             );
                         }
+
                         safe_lock(&state_clone.spawned_pids).push(pid);
                         let stdout = proc.stdout.take().unwrap();
                         let stderr = proc.stderr.take();
@@ -588,8 +695,10 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 }
                             });
                         }
+
                         let tracker = Arc::clone(&state_clone.thread_tracker);
                         let is_debug_stream = state_clone.is_debug;
+                        let target_for_stdout = target_clone.clone();
                         thread::spawn(move || {
                             let reader = BufReader::new(stdout);
                             let mut line_count = 0;
@@ -597,6 +706,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 match line {
                                     Ok(l) => {
                                         line_count += 1;
+
+                                        if is_debug_stream {
+                                            eprintln!(
+                                                "{}[Руник STDOUT]{}[{}] {}",
+                                                GREEN, RESET, target_for_stdout, l
+                                            );
+                                        }
+
                                         let js = build_js_callback(&CompactResponse {
                                             action: "stream",
                                             status: "stream_data",
@@ -604,6 +721,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             data: Some(&l),
                                         });
                                         let _ = sender_clone.try_send(js);
+
                                         if is_debug_stream && line_count % STREAM_STATS_BATCH == 0 {
                                             let stats = get_resource_stats();
                                             tracker.update_thread_statistics(
@@ -616,10 +734,16 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     Err(_) => break,
                                 }
                             }
+
                             if is_debug_stream {
                                 let final_stats = get_resource_stats();
                                 tracker.finish_thread(thread_id, &final_stats);
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => завершён, прочитано строк: {}",
+                                    CYAN, RESET, target_for_stdout, line_count
+                                );
                             }
+
                             if let Some(mut child) =
                                 safe_lock(&state_clone.running_streams).remove(&target_clone)
                             {
@@ -631,6 +755,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                     Err(e) => {
                         drop(running);
+                        if is_debug {
+                            eprintln!(
+                                "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => ОШИБКА запуска: {}",
+                                RED, RESET, target_clone, e
+                            );
+                        }
                         send_js(
                             "stream",
                             "error",
@@ -640,12 +770,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                 }
             }
+
             "unstream" => {
                 let target = request
                     .payload
                     .get("target")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+
                 let mut running = safe_lock(&state.running_streams);
                 if let Some(child) = running.remove(target) {
                     let pid = child.id();
@@ -656,11 +788,25 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                     let mut pids = safe_lock(&state.spawned_pids);
                     pids.retain(|&p| p != pid);
+
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} unstream '{}' => остановлен, PID={}",
+                            GREEN, RESET, target, pid
+                        );
+                    }
                     send_js("unstream", "success", "Остановлен", None);
                 } else {
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} unstream '{}' => не найден",
+                            YELLOW, RESET, target
+                        );
+                    }
                     send_js("unstream", "error", "Не найден", None);
                 }
             }
+
             "watch" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 let tail = request.payload.get("tail").and_then(|v| v.as_u64());
@@ -670,6 +816,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     {
                         let mut positions = safe_lock(&state.watch_positions);
                         if positions.contains_key(&path_str) {
+                            if is_debug {
+                                eprintln!(
+                                    "{}[Руник РЕЗУЛЬТАТ]{} watch '{}' => уже мониторится",
+                                    YELLOW, RESET, path_str
+                                );
+                            }
                             send_js("watch", "error", "Уже мониторится", None);
                             return;
                         }
@@ -689,6 +841,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         };
                         positions.insert(path_str.clone(), initial_state);
                     }
+
+                    if is_debug {
+                        let mode = if path_buf.is_dir() { "директория" } else { "файл" };
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} watch '{}' => мониторинг запущен, тип: {}",
+                            GREEN, RESET, path_str, mode
+                        );
+                    }
+
                     if let Some(n) = tail {
                         if !path_buf.is_dir() && path_buf.exists() {
                             let path_clone = path_str.clone();
@@ -714,7 +875,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             } else {
                                                 0
                                             };
+                                            if is_debug_tail {
+                                                eprintln!(
+                                                    "{}[Руник РЕЗУЛЬТАТ]{} watch-tail '{}' => читаем последние {} строк из {} доступных",
+                                                    CYAN, RESET, path_clone, n, lines.len()
+                                                );
+                                            }
                                             for line in lines.iter().skip(start) {
+                                                if is_debug_tail {
+                                                    eprintln!(
+                                                        "{}[Руник НАБЛЮДЕНИЕ]{}[{}] {}",
+                                                        CYAN, RESET, path_clone, line
+                                                    );
+                                                }
                                                 let js = build_js_callback(&CompactResponse {
                                                     action: "watch",
                                                     status: "watch_data",
@@ -733,6 +906,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             });
                         }
                     }
+
                     let path_clone = path_str.clone();
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
@@ -791,6 +965,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             > Duration::from_millis(DIR_WATCH_DEBOUNCE_MS)
                                         {
                                             event_count += 1;
+                                            if is_debug_watch {
+                                                eprintln!(
+                                                    "{}[Руник НАБЛЮДЕНИЕ]{}[{}] изменение директории",
+                                                    CYAN, RESET, path_clone
+                                                );
+                                            }
                                             let js = build_js_callback(&CompactResponse {
                                                 action: "watch",
                                                 status: "watch_data",
@@ -849,6 +1029,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         for l in reader.lines().map_while(Result::ok) {
                                             if !l.is_empty() {
                                                 event_count += 1;
+                                                if is_debug_watch {
+                                                    eprintln!(
+                                                        "{}[Руник НАБЛЮДЕНИЕ]{}[{}] {}",
+                                                        CYAN, RESET, path_clone, l
+                                                    );
+                                                }
                                                 let js = build_js_callback(&CompactResponse {
                                                     action: "watch",
                                                     status: "watch_data",
@@ -890,29 +1076,73 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         if is_debug_watch {
                             let final_stats = get_resource_stats();
                             tracker.finish_thread(thread_id, &final_stats);
+                            eprintln!(
+                                "{}[Руник РЕЗУЛЬТАТ]{} watch '{}' => поток наблюдения завершён, событий: {}",
+                                CYAN, RESET, path_clone, event_count
+                            );
                         }
                     });
                     send_js("watch", "success", "Мониторинг запущен", None);
+                } else if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} watch => не указан путь",
+                        YELLOW, RESET
+                    );
                 }
             }
+
             "unwatch" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 if let Some(p) = path {
                     let mut positions = safe_lock(&state.watch_positions);
                     if positions.remove(p).is_some() {
+                        if is_debug {
+                            eprintln!(
+                                "{}[Руник РЕЗУЛЬТАТ]{} unwatch '{}' => мониторинг остановлен",
+                                GREEN, RESET, p
+                            );
+                        }
                         send_js("unwatch", "success", "Мониторинг остановлен", None);
                     } else {
+                        if is_debug {
+                            eprintln!(
+                                "{}[Руник РЕЗУЛЬТАТ]{} unwatch '{}' => файл не мониторится",
+                                YELLOW, RESET, p
+                            );
+                        }
                         send_js("unwatch", "error", "Файл не мониторится", None);
                     }
                 } else {
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} unwatch => не указан путь",
+                            YELLOW, RESET
+                        );
+                    }
                     send_js("unwatch", "error", "Не указан путь к файлу", None);
                 }
             }
+
             "stats" => {
                 let summary = state.thread_tracker.get_summary();
+                if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} stats => запрошена статистика потоков",
+                        CYAN, RESET
+                    );
+                }
                 send_js("stats", "success", &summary, None);
             }
-            _ => send_js(&request.action, "error", "Неизвестное действие", None),
+
+            _ => {
+                if is_debug {
+                    eprintln!(
+                        "{}[Руник РЕЗУЛЬТАТ]{} неизвестное действие: '{}'",
+                        YELLOW, RESET, request.action
+                    );
+                }
+                send_js(&request.action, "error", "Неизвестное действие", None);
+            }
         }
 
         if is_debug {
@@ -957,7 +1187,6 @@ fn main() {
     let x = args.x;
     let y = args.y;
     let is_debug = args.debug;
-
     let abs_path = match fs::canonicalize(&html_path) {
         Ok(p) => p,
         Err(e) => {
@@ -969,7 +1198,6 @@ fn main() {
         }
     };
     let file_url = format!("file://{}", abs_path.display());
-
     gtk::init().expect("Не удалось инициализировать GTK");
     let window = gtk::Window::new(gtk::WindowType::Popup);
     window.set_default_size(800, 600);
@@ -989,7 +1217,6 @@ fn main() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
-
     init_for_window(&window);
     set_layer(&window, Layer::Background);
     set_keyboard_interactivity(&window, false);
@@ -1012,7 +1239,6 @@ fn main() {
         }
     }
     set_exclusive_zone(&window, 0);
-
     let webview = WebView::new();
     webview.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
     if let Some(settings) = WebViewExt::settings(&webview) {
@@ -1027,7 +1253,6 @@ fn main() {
         settings.set_enable_smooth_scrolling(false);
         settings.set_enable_page_cache(false);
     }
-
     let controller = webview
         .user_content_manager()
         .expect("WebView должен иметь user_content_manager");
@@ -1043,11 +1268,9 @@ fn main() {
         thread_tracker: Arc::clone(&thread_tracker),
         pool: Arc::clone(&pool),
     });
-
     let (js_sender, js_receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
     let state_clone = Arc::clone(&app_state);
     let sender_for_handler = js_sender.clone();
-
     let registered = controller.register_script_message_handler("ipc");
     if is_debug {
         eprintln!(
@@ -1055,7 +1278,6 @@ fn main() {
             CYAN, RESET, registered
         );
     }
-
     controller.connect_script_message_received(
         Some("ipc"),
         move |_controller, msg: &webkit2gtk::JavascriptResult| {
@@ -1074,7 +1296,6 @@ fn main() {
             }
         },
     );
-
     let shim = UserScript::new(
         r#"
         window.ipc = {
@@ -1100,7 +1321,6 @@ fn main() {
     webview.load_uri(&file_url);
     window.add(&webview);
     window.show_all();
-
     let webview_for_async = webview.clone();
     let is_debug_for_async = is_debug;
     glib::spawn_future_local(async move {
@@ -1119,7 +1339,6 @@ fn main() {
             });
         }
     });
-
     window.connect_delete_event({
         let state_clone = Arc::clone(&app_state);
         move |_, _| {
@@ -1128,7 +1347,6 @@ fn main() {
             Propagation::Stop
         }
     });
-
     glib::source::unix_signal_add(libc::SIGTERM, {
         let state_clone = Arc::clone(&app_state);
         move || {
@@ -1137,7 +1355,6 @@ fn main() {
             glib::ControlFlow::Break
         }
     });
-
     glib::source::unix_signal_add(libc::SIGINT, {
         let state_clone = Arc::clone(&app_state);
         move || {
@@ -1146,10 +1363,8 @@ fn main() {
             glib::ControlFlow::Break
         }
     });
-
     if is_debug {
         eprintln!("{}[Руник ОТЛАДКА]{} Режим отладки включен", CYAN, RESET);
-
         let tracker_for_stats = Arc::clone(&thread_tracker);
         let shutdown_for_stats = Arc::clone(&shutdown_flag);
         std::thread::spawn(move || {
@@ -1160,7 +1375,6 @@ fn main() {
                 }
             }
         });
-
         if let Some(html_dir) = abs_path.parent() {
             let html_dir = html_dir.to_path_buf();
             let (reload_sender, reload_receiver) = async_channel::bounded::<()>(16);
@@ -1248,7 +1462,6 @@ fn main() {
             });
         }
     }
-
     let state_for_resume = Arc::clone(&app_state);
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
@@ -1275,7 +1488,6 @@ fn main() {
             last_time = now;
         }
     });
-
     gtk::main();
 }
 

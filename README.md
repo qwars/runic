@@ -247,16 +247,38 @@ Tracks file changes using the `inotify` system call (zero CPU load while waiting
 
 The `--debug` flag enables:
 
-- All IPC messages printed to the terminal with colored formatting.
-- `console.log` from JS redirected to stdout.
-- Size and positioning information.
-- **Thread statistics**: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds.
+- **All IPC messages printed** to the terminal with colored formatting.
+- **`console.log` from JS** redirected to stdout.
+- **Size and positioning information**.
+- **Thread statistics**: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds. Includes lifespan of each thread in milliseconds.
 - **Hot-reload**: automatic widget reload when `.html`, `.css`, `.js` files change in the widget directory (300ms debounce protection).
 - **Profiling**: performance metrics logged when thresholds are exceeded.
+- **Extended execution result logging**:
+  - 🔵 `read`: path, file size, content preview (first 100 characters), execution time
+  - 🔵 `write`: path, bytes written, mode (append/truncate), execution time
+  - 🔵 `exec`: command, exit code, output preview (first 200 characters), execution time
+  - 🔵 `stream`: process PID, each line from stdout/stderr, completion status with line count
+  - 🔵 `watch`: object type (file/directory), data from tail, each detected change, completion status with event count
+  - 🔵 `unstream`/`unwatch`: stop result with PID or path
+
+**Example debug output:**
+
+```
+[Руник ОТЛАДКА] Режим отладки включен
+[Руник ОТЛАДКА] Обработчик 'ipc' зарегистрирован: true
+[Руник ОТЛАДКА] Получено: {"action":"exec","payload":{"command":"uname -a"}}
+[Руник ОТЛАДКА] exec запуск: 'uname -a'
+[Руник РЕЗУЛЬТАТ] exec 'uname -a' => код выхода: Some(0), 15мс, вывод: 'Linux hostname 6.1.0...'
+[Руник Профиль] 'exec' выполнен за 15ms | Память: 45200 KB | CPU: 120 ms
+```
+
+Launch in debug mode:
 
 ```bash
 cargo run -- examples/test.html/index.html --debug
 ```
+
+**Important**: In normal mode (without `--debug`), the program runs quietly — no console output and no error messages sent to the widget (except critical startup errors). This allows using Runic in production without log pollution.
 
 ---
 
