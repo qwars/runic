@@ -241,24 +241,39 @@ impl ThreadTracker {
     }
 }
 
+/// Обертка над std::process::Child, которая гарантирует убийство процесса при уничтожении (drop).
+pub struct ChildGuard(pub std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+use std::ops::{Deref, DerefMut};
+
+impl Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 struct AppState {
-    running_streams: Mutex<HashMap<String, std::process::Child>>,
+    running_streams: Mutex<HashMap<String, ChildGuard>>,
     watch_positions: Mutex<HashMap<String, WatchState>>,
     spawned_pids: Mutex<Vec<u32>>,
     is_debug: bool,
     shutdown: Arc<AtomicBool>,
     thread_tracker: Arc<ThreadTracker>,
     pool: Arc<ThreadPool>,
-}
-
-fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        eprintln!(
-            "{}[Руник ОШИБКА]{} Мьютекс отравлен, восстанавливаем...",
-            RED, RESET
-        );
-        poisoned.into_inner()
-    })
 }
 
 #[derive(Copy, Clone)]
@@ -312,7 +327,7 @@ fn cleanup_children(state: &Arc<AppState>) {
     }
     state.shutdown.store(true, Ordering::Relaxed);
     let pids: Vec<u32> = {
-        let mut guard = safe_lock(&state.spawned_pids);
+        let mut guard = state.spawned_pids.lock().unwrap();
         std::mem::take(&mut *guard)
     };
     if pids.is_empty() {
@@ -368,7 +383,7 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
     state.shutdown.store(true, Ordering::Relaxed);
     let mut killed_pids = Vec::new();
     {
-        let mut streams = safe_lock(&state.running_streams);
+        let mut streams = state.running_streams.lock().unwrap();
         for (_, child) in streams.drain() {
             let pid = child.id();
             killed_pids.push(pid);
@@ -380,7 +395,7 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
         }
     }
     {
-        let mut pids = safe_lock(&state.spawned_pids);
+        let mut pids = state.spawned_pids.lock().unwrap();
         pids.retain(|p| !killed_pids.contains(p));
         for &pid in pids.iter() {
             unsafe {
@@ -646,7 +661,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     });
                 }
 
-                let mut running = safe_lock(&state.running_streams);
+                let mut running = state.running_streams.lock().unwrap();
                 if running.contains_key(&target) {
                     if is_debug {
                         eprintln!(
@@ -672,10 +687,10 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             );
                         }
 
-                        safe_lock(&state_clone.spawned_pids).push(pid);
+                        state_clone.spawned_pids.lock().unwrap().push(pid);
                         let stdout = proc.stdout.take().unwrap();
                         let stderr = proc.stderr.take();
-                        running.insert(target_clone.clone(), proc);
+                        running.insert(target_clone.clone(), ChildGuard(proc));
                         drop(running);
 
                         send_js("stream", "success", "Запущен", None);
@@ -744,12 +759,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 );
                             }
 
-                            if let Some(mut child) =
-                                safe_lock(&state_clone.running_streams).remove(&target_clone)
+                            if let Some(child_guard) =
+                                state_clone.running_streams.lock().unwrap().remove(&target_clone)
                             {
-                                let _ = child.wait();
-                                let mut pids = safe_lock(&state_clone.spawned_pids);
-                                pids.retain(|&p| p != child.id());
+                                // child_guard будет удален здесь, что вызовет Drop и убьет процесс
+                                // Но мы также явно ждем завершения через wait в Drop
+                                // Для очистки spawned_pids:
+                                let mut pids = state_clone.spawned_pids.lock().unwrap();
+                                pids.retain(|&p| p != child_guard.id());
                             }
                         });
                     }
@@ -778,15 +795,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let mut running = safe_lock(&state.running_streams);
-                if let Some(child) = running.remove(target) {
-                    let pid = child.id();
+                let mut running = state.running_streams.lock().unwrap();
+                if let Some(child_guard) = running.remove(target) {
+                    let pid = child_guard.id();
                     unsafe {
                         libc::kill(-(pid as i32), libc::SIGKILL);
                         let mut status: libc::c_int = 0;
                         libc::waitpid(pid as libc::pid_t, &mut status, 0);
                     }
-                    let mut pids = safe_lock(&state.spawned_pids);
+                    let mut pids = state.spawned_pids.lock().unwrap();
                     pids.retain(|&p| p != pid);
 
                     if is_debug {
@@ -814,7 +831,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     let path_str = p.to_string();
                     let path_buf = std::path::PathBuf::from(&path_str);
                     {
-                        let mut positions = safe_lock(&state.watch_positions);
+                        let mut positions = state.watch_positions.lock().unwrap();
                         if positions.contains_key(&path_str) {
                             if is_debug {
                                 eprintln!(
@@ -921,7 +938,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         let mut last_dir_notification = Instant::now();
                         while !state_clone.shutdown.load(Ordering::Relaxed) {
                             {
-                                let positions = safe_lock(&state_clone.watch_positions);
+                                let positions = state_clone.watch_positions.lock().unwrap();
                                 if !positions.contains_key(&path_clone) {
                                     break;
                                 }
@@ -941,7 +958,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 .map(|d| d.as_secs())
                                         });
                                     let should_notify = {
-                                        let mut positions = safe_lock(&state_clone.watch_positions);
+                                        let mut positions = state_clone.watch_positions.lock().unwrap();
                                         if let Some(WatchState::Dir(last_mod)) =
                                             positions.get_mut(&path_clone)
                                         {
@@ -1010,7 +1027,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         }
                                     };
                                     let current_pos = {
-                                        let positions = safe_lock(&state_clone.watch_positions);
+                                        let positions = state_clone.watch_positions.lock().unwrap();
                                         if let Some(WatchState::File(pos)) =
                                             positions.get(&path_clone)
                                         {
@@ -1045,7 +1062,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             }
                                         }
                                     }
-                                    let mut positions = safe_lock(&state_clone.watch_positions);
+                                    let mut positions = state_clone.watch_positions.lock().unwrap();
                                     if let Some(WatchState::File(pos_opt)) =
                                         positions.get_mut(&path_clone)
                                     {
@@ -1063,7 +1080,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 }
                             } else {
                                 held_file = None;
-                                let mut positions = safe_lock(&state_clone.watch_positions);
+                                let mut positions = state_clone.watch_positions.lock().unwrap();
                                 if let Some(state) = positions.get_mut(&path_clone) {
                                     match state {
                                         WatchState::File(pos) => *pos = None,
@@ -1094,7 +1111,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             "unwatch" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 if let Some(p) = path {
-                    let mut positions = safe_lock(&state.watch_positions);
+                    let mut positions = state.watch_positions.lock().unwrap();
                     if positions.remove(p).is_some() {
                         if is_debug {
                             eprintln!(
@@ -1644,13 +1661,13 @@ mod tests {
         assert_eq!(data_response.status, "stream_data");
         assert_eq!(data_response.data, Some("stream_data_test".to_string()));
         sleep(Duration::from_millis(500));
-        let running = safe_lock(&state.running_streams);
+        let running = state.running_streams.lock().unwrap();
         assert!(
             running.is_empty(),
             "Поток должен быть удалён из running_streams"
         );
         drop(running);
-        let pids = safe_lock(&state.spawned_pids);
+        let pids = state.spawned_pids.lock().unwrap();
         assert!(
             pids.is_empty(),
             "PID должен быть удалён из spawned_pids после завершения"
@@ -1690,8 +1707,8 @@ mod tests {
         assert_eq!(dup_response.action, "stream");
         assert_eq!(dup_response.status, "error");
         assert_eq!(dup_response.message, "Уже выполняется");
-        safe_lock(&state.running_streams).clear();
-        safe_lock(&state.spawned_pids).clear();
+        state.running_streams.lock().unwrap().clear();
+        state.spawned_pids.lock().unwrap().clear();
     }
 
     #[test]
@@ -1727,11 +1744,15 @@ mod tests {
         }
         assert!(got_success, "Должно прийти подтверждение запуска watch");
         assert!(got_watch_data, "Должны прийти данные из файла (tail)");
-        let positions = safe_lock(&state.watch_positions);
+        let positions = state.watch_positions.lock().unwrap();
         assert!(positions.contains_key(file_path.to_str().unwrap()));
         drop(positions);
         std::thread::sleep(Duration::from_millis(100));
-        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
+        state
+            .watch_positions
+            .lock()
+            .unwrap()
+            .remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -1756,7 +1777,11 @@ mod tests {
         assert_eq!(response.action, "watch");
         assert_eq!(response.status, "error");
         assert_eq!(response.message, "Уже мониторится");
-        safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
+        state
+            .watch_positions
+            .lock()
+            .unwrap()
+            .remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
     }
 
@@ -1781,7 +1806,7 @@ mod tests {
         let response = get_response(&receiver);
         assert_eq!(response.action, "unwatch");
         assert_eq!(response.status, "success");
-        let positions = safe_lock(&state.watch_positions);
+        let positions = state.watch_positions.lock().unwrap();
         assert!(!positions.contains_key(file_path.to_str().unwrap()));
         let _ = std::fs::remove_file(&file_path);
     }
@@ -1810,11 +1835,15 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        safe_lock(&state.spawned_pids).push(pid);
-        safe_lock(&state.running_streams).insert("test".to_string(), child);
+        state.spawned_pids.lock().unwrap().push(pid);
+        state
+            .running_streams
+            .lock()
+            .unwrap()
+            .insert("test".to_string(), ChildGuard(child));
         kill_and_clear_tracked(&state);
-        assert!(safe_lock(&state.running_streams).is_empty());
-        assert!(safe_lock(&state.spawned_pids).is_empty());
+        assert!(state.running_streams.lock().unwrap().is_empty());
+        assert!(state.spawned_pids.lock().unwrap().is_empty());
     }
 
     #[test]

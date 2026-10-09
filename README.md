@@ -2,9 +2,7 @@
 
 A lightweight engine for rendering HTML/CSS/JS widgets on Linux desktops. A modern alternative to Conky with a web stack: write widgets using familiar HTML, CSS, and JavaScript, while Runic handles system integration through a transparent IPC bridge.
 
-Built with **Rust + GTK3 + WebKitGTK + Layer Shell** (Wayland).
-
----
+Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 
 ## Features
 
@@ -19,33 +17,26 @@ Built with **Rust + GTK3 + WebKitGTK + Layer Shell** (Wayland).
 - **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (in `--debug` mode)
 - **Sleep wake detector** — automatic widget reload after system wake-up
 
----
-
-## 🚀 Performance (v1.3.0)
+## 🚀 Performance (v1.4.0)
 
 The project is optimized for minimal resource consumption:
 
-| Metric                 | Value                 |
-|------------------------|-----------------------|
-| Peak memory at startup | ~30-50 MB             |
-| Thread count           | 8-12 (fixed pool)     |
-| Idle CPU               | <1%                   |
-| IPC response time      | <1 ms                 |
-| Zombie processes       | None (Process Groups) |
+| Metric                 | Value                              |
+|------------------------|------------------------------------|
+| Peak memory at startup | ~30-50 MB                          |
+| Thread count           | 8-12 (fixed pool)                  |
+| Idle CPU               | <1%                                |
+| IPC response time      | <1 ms                              |
+| Zombie processes       | None (Process Groups + ChildGuard) |
 
-**ThreadPool**: a fixed pool of 8 worker threads handles all IPC requests. Eliminated ~800 MB memory consumption and kernel scheduler overhead.
+- **ThreadPool**: a fixed pool of 8 worker threads handles all IPC requests. Eliminated ~800 MB memory consumption and kernel scheduler overhead.
+- **Process Groups**: all `sh -c` commands are launched in a separate process group. On termination, the entire group receives `SIGTERM`/`SIGKILL` — child processes (e.g., `tail -f`, `ping`) no longer become orphans.
+- **ChildGuard**: every child process is wrapped in a `ChildGuard` structure with `Drop` implementation, which guarantees process termination on any exit (normal or via panic). This prevents orphan processes even in case of failures.
+- **Directory debouncing**: 500 ms time-based debounce prevents inotify notification storms when scripts trigger events in monitored directories.
+- **Non-blocking channels**: `try_send` instead of `send_blocking` eliminates potential deadlocks when GTK main loop hangs.
+- **Monotonic clocks**: `Instant` instead of `SystemTime` for the sleep detector — correct behavior during system clock adjustments and NTP synchronization.
 
-**Process Groups**: all `sh -c` commands are launched in a separate process group. On termination, the entire group receives `SIGTERM`/`SIGKILL` — child processes (e.g., `tail -f`, `ping`) no longer become orphans.
-
-**Directory debouncing**: 500 ms time-based debounce prevents inotify notification storms when scripts trigger events in monitored directories.
-
-**Non-blocking channels**: `try_send` instead of `send_blocking` eliminates potential deadlocks when GTK main loop hangs.
-
-**Monotonic clocks**: `Instant` instead of `SystemTime` for the sleep detector — correct behavior during system clock adjustments and NTP synchronization.
-
----
-
-## 🛡️ Reliability & Security (v1.3.0)
+## 🛡️ Reliability & Security (v1.4.0)
 
 The project undergoes continuous security and stability audits:
 
@@ -53,11 +44,10 @@ The project undergoes continuous security and stability audits:
 - **Thread Tracking (`ThreadTracker`)**: Comprehensive monitoring of active and completed background threads, including peak memory, lifespan, and task count, preventing silent resource exhaustion.
 - **Colored Debug Output**: ANSI-colored console logs for instant visual parsing of Errors (🔴), Warnings (🟡), Success (🟢), Debug info (🔵), and Profiling data (🟣).
 - **Atomic process management**: Eliminated TOCTOU (Time-of-Check to Time-of-Use) race conditions when launching streaming commands. Repeated `stream` calls with the same argument are now guaranteed to be blocked.
-- **Safe resource cleanup**: Eliminated double-kill scenarios and panics during `SIGTERM`/`SIGINT` signal handling. All mutexes are protected against poisoning.
+- **Safe resource cleanup via ChildGuard**: all child processes are wrapped in `ChildGuard`, which guarantees their termination on any exit (normal or via panic). Eliminated the possibility of orphan processes even in case of failures.
+- **Fail-fast on panics**: when a mutex is poisoned, the application panics, preventing work with inconsistent state. All child processes are automatically killed via the `Drop` mechanism.
 - **Graceful Shutdown**: All background threads receive a stop signal and terminate cleanly, leaving no zombie processes or memory leaks.
 - **Code Quality**: The codebase fully complies with strict `cargo clippy -- -D warnings` checks and includes 15 comprehensive unit tests.
-
----
 
 ## Requirements
 
@@ -65,26 +55,21 @@ The project undergoes continuous security and stability audits:
 - **System libraries**: GTK 3.24+, WebKitGTK 4.1, gtk-layer-shell
 - **Rust**: 1.70+ (for building)
 
----
-
 ## Installation
 
 ### 1. System dependencies
 
 **Debian 13 / Ubuntu:**
-
 ```bash
 sudo apt install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
 ```
 
 **Arch Linux:**
-
 ```bash
 sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
 ```
 
 **Fedora:**
-
 ```bash
 sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
 ```
@@ -98,8 +83,6 @@ cargo build --release
 ```
 
 The binary will be at `target/release/runic`.
-
----
 
 ## Usage
 
@@ -140,8 +123,6 @@ Add to `~/.config/sway/config`:
 exec /home/user/runic/target/release/runic /home/user/runic/widgets/clock.html -w 300 -H 150 -x 50 -y 50
 ```
 
----
-
 ## Widget API
 
 Runic provides a JavaScript object `window.ipc` for system interaction.
@@ -179,7 +160,7 @@ window.onRunicResponse = function (response) {
 { "action": "read", "payload": { "path": "/etc/os-release" } }
 ```
 
-**Response**: `data` contains file contents.
+Response: `data` contains file contents.
 
 #### `write` — append to a file
 
@@ -195,7 +176,7 @@ window.onRunicResponse = function (response) {
 { "action": "exec", "payload": { "command": "df -h" } }
 ```
 
-**Response**: `data` contains `stdout` on success or `STDERR:\n...` on error. Command runs via `sh -c` isolated in a Process Group.
+Response: `data` contains `stdout` on success or `STDERR:\n...` on error. Command runs via `sh -c` isolated in a Process Group.
 
 #### `stream` — streaming execution
 
@@ -203,7 +184,7 @@ window.onRunicResponse = function (response) {
 { "action": "stream", "payload": { "target": "ping -c 10 8.8.8.8" } }
 ```
 
-**Response**: Arrives multiple times, one line at a time, with status `stream_data`. Perfect for `top`, `ping`, `tail -f`, and other long-running commands. Re-running the same command is blocked until the previous one completes.
+Response: Arrives multiple times, one line at a time, with status `stream_data`. Perfect for `top`, `ping`, `tail -f`, and other long-running commands. Re-running the same command is blocked until the previous one completes.
 
 #### `unstream` — stop a streaming command
 
@@ -211,7 +192,7 @@ window.onRunicResponse = function (response) {
 { "action": "unstream", "payload": { "target": "ping -c 10 8.8.8.8" } }
 ```
 
-**Response**: Stops a previously started `stream` command. The entire Process Group receives `SIGKILL`, and the stream is removed from the active list.
+Response: Stops a previously started `stream` command. The entire Process Group receives `SIGKILL`, and the stream is removed from the active list.
 
 #### `watch` — monitor a file via inotify
 
@@ -221,9 +202,11 @@ window.onRunicResponse = function (response) {
 
 Tracks file changes using the `inotify` system call (zero CPU load while waiting for events). On each file change, new lines are sent to the widget with status `watch_data`.
 
-- **Parameters**: `path` (required), `tail` (optional, number of last lines to send on startup).
-- **Important**: Re-running `watch` for the same file will return an error. Use `unwatch` to stop.
-- **Note**: Reading system logs requires membership in the `adm` group.
+**Parameters**: `path` (required), `tail` (optional, number of last lines to send on startup).
+
+**Important**: Re-running `watch` for the same file will return an error. Use `unwatch` to stop.
+
+**Note**: Reading system logs requires membership in the `adm` group.
 
 #### `unwatch` — stop file monitoring
 
@@ -231,7 +214,7 @@ Tracks file changes using the `inotify` system call (zero CPU load while waiting
 { "action": "unwatch", "payload": { "path": "/var/log/syslog" } }
 ```
 
-**Response**: Stops monitoring a file previously started via `watch`. The inotify thread terminates, and the file descriptor is released.
+Response: Stops monitoring a file previously started via `watch`. The inotify thread terminates, and the file descriptor is released.
 
 #### `stats` — thread statistics
 
@@ -239,29 +222,29 @@ Tracks file changes using the `inotify` system call (zero CPU load while waiting
 { "action": "stats" }
 ```
 
-**Response**: Returns a summary of active and completed threads — peak memory usage, lifespan, and task count.
-
----
+Response: Returns a summary of active and completed threads — peak memory usage, lifespan, and task count.
 
 ## Debug mode
 
 The `--debug` flag enables:
 
-- **All IPC messages printed** to the terminal with colored formatting.
-- **`console.log` from JS** redirected to stdout.
-- **Size and positioning information**.
+- All IPC messages printed to the terminal with colored formatting.
+- `console.log` from JS redirected to stdout.
+- Size and positioning information.
 - **Thread statistics**: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds. Includes lifespan of each thread in milliseconds.
 - **Hot-reload**: automatic widget reload when `.html`, `.css`, `.js` files change in the widget directory (300ms debounce protection).
 - **Profiling**: performance metrics logged when thresholds are exceeded.
-- **Extended execution result logging**:
-  - 🔵 `read`: path, file size, content preview (first 100 characters), execution time
-  - 🔵 `write`: path, bytes written, mode (append/truncate), execution time
-  - 🔵 `exec`: command, exit code, output preview (first 200 characters), execution time
-  - 🔵 `stream`: process PID, each line from stdout/stderr, completion status with line count
-  - 🔵 `watch`: object type (file/directory), data from tail, each detected change, completion status with event count
-  - 🔵 `unstream`/`unwatch`: stop result with PID or path
 
-**Example debug output:**
+### Extended execution result logging:
+
+- 🔵 `read`: path, file size, content preview (first 100 characters), execution time
+- 🔵 `write`: path, bytes written, mode (append/truncate), execution time
+- 🔵 `exec`: command, exit code, output preview (first 200 characters), execution time
+- 🔵 `stream`: process PID, each line from stdout/stderr, completion status with line count
+- 🔵 `watch`: object type (file/directory), data from tail, each detected change, completion status with event count
+- 🔵 `unstream`/`unwatch`: stop result with PID or path
+
+### Example debug output:
 
 ```
 [Руник ОТЛАДКА] Режим отладки включен
@@ -272,7 +255,7 @@ The `--debug` flag enables:
 [Руник Профиль] 'exec' выполнен за 15ms | Память: 45200 KB | CPU: 120 ms
 ```
 
-Launch in debug mode:
+### Launch in debug mode:
 
 ```bash
 cargo run -- examples/test.html/index.html --debug
@@ -280,13 +263,9 @@ cargo run -- examples/test.html/index.html --debug
 
 **Important**: In normal mode (without `--debug`), the program runs quietly — no console output and no error messages sent to the widget (except critical startup errors). This allows using Runic in production without log pollution.
 
----
-
 ## License
 
 MIT
-
----
 
 ## Acknowledgments
 
