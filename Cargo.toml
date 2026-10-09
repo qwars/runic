@@ -1,6 +1,6 @@
 [package]
 name = "runic"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 description = "Lightweight HTML/CSS/JS desktop widget engine for Linux (Wayland)"
 authors = ["Alexandr Selunin <aka.qwars@gmail.com>"]

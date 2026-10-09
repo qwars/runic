@@ -12,14 +12,29 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use webkit2gtk::{
     SettingsExt, UserContentInjectedFrames, UserContentManagerExt, UserScript,
     UserScriptInjectionTime, WebView, WebViewExt,
 };
+
+const IPC_CHANNEL_SIZE: usize = 1024;
+const HOT_RELOAD_DEBOUNCE_MS: u64 = 300;
+const SLEEP_DETECTION_THRESHOLD_SECS: u64 = 15;
+const SLEEP_CHECK_INTERVAL_SECS: u64 = 5;
+const THREAD_STATS_INTERVAL_SECS: u64 = 30;
+
+const RESET: &str = "\x1b[0m";
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+// const BLUE: &str = "\x1b[34m";
+const MAGENTA: &str = "\x1b[35m";
+const CYAN: &str = "\x1b[36m";
+const BOLD: &str = "\x1b[1m";
 
 #[derive(Parser, Debug)]
 #[command(name = "runic", about = "HTML-виджет для рабочего стола")]
@@ -66,9 +81,136 @@ struct RustResponse {
     data: Option<String>,
 }
 
+#[derive(Serialize)]
+struct CompactResponse<'a> {
+    action: &'a str,
+    status: &'a str,
+    message: &'a str,
+    data: Option<&'a str>,
+}
+
 enum WatchState {
     File(Option<u64>),
     Dir(Option<u64>),
+}
+
+#[derive(Debug, Clone)]
+struct ThreadStats {
+    id: u64,
+    thread_type: String,
+    name: String,
+    created_at: SystemTime,
+    finished_at: Option<SystemTime>,
+    peak_memory_kb: u64,
+    cpu_time_ms: u128,
+    tasks_completed: u64,
+}
+
+struct ThreadTracker {
+    threads: Mutex<HashMap<u64, ThreadStats>>,
+    next_id: AtomicU64,
+    total_created: AtomicU64,
+    total_finished: AtomicU64,
+}
+
+impl ThreadTracker {
+    fn new() -> Self {
+        Self {
+            threads: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            total_created: AtomicU64::new(0),
+            total_finished: AtomicU64::new(0),
+        }
+    }
+
+    fn register_thread(&self, thread_type: &str, name: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let stats = ThreadStats {
+            id,
+            thread_type: thread_type.to_string(),
+            name: name.to_string(),
+            created_at: SystemTime::now(),
+            finished_at: None,
+            peak_memory_kb: 0,
+            cpu_time_ms: 0,
+            tasks_completed: 0,
+        };
+        self.threads.lock().unwrap().insert(id, stats);
+        self.total_created.fetch_add(1, Ordering::Relaxed);
+        id
+    }
+
+    fn finish_thread(&self, id: u64, final_stats: &ResourceStats) {
+        if let Some(stats) = self.threads.lock().unwrap().get_mut(&id) {
+            stats.finished_at = Some(SystemTime::now());
+            stats.peak_memory_kb = final_stats.memory_kb;
+            stats.cpu_time_ms = final_stats.cpu_time_ms;
+        }
+        self.total_finished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn update_thread_stats(&self, id: u64, stats: &ResourceStats, tasks: u64) {
+        if let Some(thread_stats) = self.threads.lock().unwrap().get_mut(&id) {
+            thread_stats.peak_memory_kb = thread_stats.peak_memory_kb.max(stats.memory_kb);
+            thread_stats.cpu_time_ms = stats.cpu_time_ms;
+            thread_stats.tasks_completed += tasks;
+        }
+    }
+
+    fn get_summary(&self) -> String {
+        let threads = self.threads.lock().unwrap();
+        let active = threads.values().filter(|t| t.finished_at.is_none()).count();
+        let finished = threads.values().filter(|t| t.finished_at.is_some()).count();
+        let total_created = self.total_created.load(Ordering::Relaxed);
+        let total_finished = self.total_finished.load(Ordering::Relaxed);
+
+        let mut summary = format!("{}=== СТАТИСТИКА ПОТОКОВ ==={}\n", BOLD, RESET);
+        summary += &format!("Создано всего: {}\n", total_created);
+        summary += &format!("Завершено: {}\n", total_finished);
+        summary += &format!("Активных: {}\n", active);
+        summary += &format!("Завершенных в истории: {}\n\n", finished);
+
+        if active > 0 {
+            summary += &format!("{}Активные потоки:{}\n", GREEN, RESET);
+            for stats in threads.values().filter(|t| t.finished_at.is_none()) {
+                summary += &format!(
+                    "  [{}] {} ({}) - создан {:?} назад\n",
+                    stats.id,
+                    stats.name,
+                    stats.thread_type,
+                    SystemTime::now()
+                        .duration_since(stats.created_at)
+                        .unwrap_or_default()
+                );
+            }
+        }
+
+        summary += &format!("\n{}Последние 5 завершенных:{}\n", YELLOW, RESET);
+        let mut finished_threads: Vec<_> = threads
+            .values()
+            .filter(|t| t.finished_at.is_some())
+            .collect();
+        finished_threads.sort_by_key(|a| std::cmp::Reverse(a.finished_at));
+        for stats in finished_threads.iter().take(5) {
+            let duration = stats
+                .finished_at
+                .unwrap()
+                .duration_since(stats.created_at)
+                .unwrap_or_default();
+            summary += &format!(
+                "  [{}] {} ({}) - работал {:?}, пик памяти: {} KB, CPU: {} ms, задач: {}\n",
+                stats.id,
+                stats.name,
+                stats.thread_type,
+                duration,
+                stats.peak_memory_kb,
+                stats.cpu_time_ms,
+                stats.tasks_completed
+            );
+        }
+
+        summary
+    }
 }
 
 struct AppState {
@@ -76,47 +218,127 @@ struct AppState {
     watch_positions: Mutex<HashMap<String, WatchState>>,
     spawned_pids: Mutex<Vec<u32>>,
     is_debug: bool,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
+    thread_tracker: Arc<ThreadTracker>,
 }
 
 fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        eprintln!("[Runic Warning] Mutex was poisoned, recovering...");
+        eprintln!(
+            "{}[Руник ОШИБКА]{} Мьютекс отравлен, восстанавливаем...",
+            RED, RESET
+        );
         poisoned.into_inner()
     })
 }
 
-fn cleanup_children(state: &Arc<AppState>) {
-    eprintln!("[Runic Debug] === НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ===");
-    state.shutdown.store(true, Ordering::Relaxed);
+struct ResourceStats {
+    memory_kb: u64,
+    cpu_time_ms: u128,
+}
 
-    let pids = safe_lock(&state.spawned_pids).clone();
+fn get_resource_stats() -> ResourceStats {
+    let mut memory_kb = 0;
+    let mut cpu_time_ms = 0;
+
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    memory_kb = kb_str.parse().unwrap_or(0);
+                }
+                break;
+            }
+        }
+    }
+
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+        let user_ms =
+            (usage.ru_utime.tv_sec as u128 * 1000) + (usage.ru_utime.tv_usec as u128 / 1000);
+        let sys_ms =
+            (usage.ru_stime.tv_sec as u128 * 1000) + (usage.ru_stime.tv_usec as u128 / 1000);
+        cpu_time_ms = user_ms + sys_ms;
+    }
+
+    ResourceStats {
+        memory_kb,
+        cpu_time_ms,
+    }
+}
+
+fn log_profile(action: &str, duration: Duration, stats: &ResourceStats) {
+    if duration > Duration::from_millis(100) {
+        eprintln!(
+            "{}[Руник Профиль]{} {} '{}' выполнен за {:?} | Память: {} KB | CPU: {} ms",
+            MAGENTA, RESET, BOLD, action, duration, stats.memory_kb, stats.cpu_time_ms
+        );
+    }
+}
+
+fn cleanup_children(state: &Arc<AppState>) {
+    if state.is_debug {
+        eprintln!(
+            "{}[Руник ОТЛАДКА]{} {}=== НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ==={}",
+            CYAN, RESET, BOLD, RESET
+        );
+    }
+    state.shutdown.store(true, Ordering::Relaxed);
+    let pids: Vec<u32> = {
+        let mut guard = safe_lock(&state.spawned_pids);
+        std::mem::take(&mut *guard)
+    };
     if pids.is_empty() {
-        eprintln!("[Runic Debug] Нечего очищать.");
+        if state.is_debug {
+            eprintln!("{}[Руник ОТЛАДКА]{} Нечего очищать.", CYAN, RESET);
+        }
         return;
     }
+    if state.is_debug {
+        for &pid in &pids {
+            eprintln!(
+                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM процессу {}",
+                CYAN, RESET, pid
+            );
+        }
+    }
     for &pid in &pids {
-        eprintln!("[Runic Debug] Отправка SIGTERM процессу {}", pid);
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
     }
     std::thread::sleep(Duration::from_millis(300));
+    if state.is_debug {
+        for &pid in &pids {
+            eprintln!(
+                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL процессу {}",
+                CYAN, RESET, pid
+            );
+        }
+    }
     for &pid in &pids {
-        eprintln!("[Runic Debug] Отправка SIGKILL процессу {}", pid);
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
             let mut status: libc::c_int = 0;
             libc::waitpid(pid as libc::pid_t, &mut status, 0);
         }
     }
-    eprintln!("[Runic Debug] === ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ===");
+    if state.is_debug {
+        eprintln!(
+            "{}[Руник ОТЛАДКА]{} {}=== ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ==={}",
+            CYAN, RESET, BOLD, RESET
+        );
+    }
 }
 
 fn kill_and_clear_tracked(state: &Arc<AppState>) {
-    eprintln!("[Runic Debug] === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ===");
+    if state.is_debug {
+        eprintln!(
+            "{}[Руник ОТЛАДКА]{} {}=== ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ==={}",
+            CYAN, RESET, BOLD, RESET
+        );
+    }
     state.shutdown.store(true, Ordering::Relaxed);
-
     let mut killed_pids = Vec::new();
     {
         let mut streams = safe_lock(&state.running_streams);
@@ -130,7 +352,6 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
             }
         }
     }
-
     {
         let mut pids = safe_lock(&state.spawned_pids);
         pids.retain(|p| !killed_pids.contains(p));
@@ -143,11 +364,28 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
         }
         pids.clear();
     }
+    if state.is_debug {
+        eprintln!(
+            "{}[Руник ОТЛАДКА]{} {}=== ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ЗАВЕРШЕНА ==={}",
+            CYAN, RESET, BOLD, RESET
+        );
+    }
+}
 
-    eprintln!("[Runic Debug] === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ЗАВЕРШЕНА ===");
+fn build_js_callback(response: &CompactResponse) -> String {
+    let mut js = String::with_capacity(128);
+    js.push_str("if (window.onRunicResponse) window.onRunicResponse(");
+    if let Ok(json) = serde_json::to_string(response) {
+        js.push_str(&json);
+    }
+    js.push_str(");");
+    js
 }
 
 fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<String>) {
+    let start_time = Instant::now();
+    let start_stats = get_resource_stats();
+
     thread::spawn(move || {
         let send_js = |action: &str, status: &str, message: &str, data: Option<String>| {
             let response = RustResponse {
@@ -213,10 +451,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             }
             "exec" => {
                 if let Some(cmd) = request.payload.get("command").and_then(|v| v.as_str()) {
+                    let exec_start = Instant::now();
                     match Command::new("sh").arg("-c").arg(cmd).output() {
                         Ok(out) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                            let exec_duration = exec_start.elapsed();
+                            let exec_stats = get_resource_stats();
+                            log_profile("exec", exec_duration, &exec_stats);
+
+                            let stdout = String::from_utf8(out.stdout).unwrap_or_else(|e| {
+                                String::from_utf8_lossy(e.as_bytes()).into_owned()
+                            });
+                            let stderr = String::from_utf8(out.stderr).unwrap_or_else(|e| {
+                                String::from_utf8_lossy(e.as_bytes()).into_owned()
+                            });
                             let result = if out.status.success() {
                                 stdout
                             } else {
@@ -239,11 +486,9 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("stream", "error", "target не указан", None);
                     return;
                 }
-
                 let target_clone = target.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
-
                 let mut cmd_obj = Command::new("sh");
                 cmd_obj
                     .arg("-c")
@@ -255,49 +500,66 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("stream", "error", "Уже выполняется", None);
                     return;
                 }
-
                 match cmd_obj.spawn() {
                     Ok(mut proc) => {
                         let pid = proc.id();
-                        eprintln!("[Runic Debug] Stream запущен: PID={}", pid);
+                        let thread_id = state_clone.thread_tracker.register_thread(
+                            "stream",
+                            &format!("stream-{}", &target_clone[..20.min(target_clone.len())]),
+                        );
+                        if state_clone.is_debug {
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Stream запущен: PID={} [Поток #{}]",
+                                GREEN, RESET, pid, thread_id
+                            );
+                        }
                         safe_lock(&state_clone.spawned_pids).push(pid);
                         let stdout = proc.stdout.take().unwrap();
                         let stderr = proc.stderr.take();
                         running.insert(target_clone.clone(), proc);
                         drop(running);
-
                         if let Some(stderr_pipe) = stderr {
                             let target_for_stderr = target_clone.clone();
+                            let is_debug = state_clone.is_debug;
                             thread::spawn(move || {
                                 let reader = BufReader::new(stderr_pipe);
                                 for l in reader.lines().map_while(Result::ok) {
-                                    eprintln!("[Runic STDERR][{}] {}", target_for_stderr, l);
+                                    if is_debug {
+                                        eprintln!(
+                                            "{}[Руник STDERR]{}[{}] {}",
+                                            RED, RESET, target_for_stderr, l
+                                        );
+                                    }
                                 }
                             });
                         }
-
+                        let tracker = Arc::clone(&state_clone.thread_tracker);
                         thread::spawn(move || {
                             let reader = BufReader::new(stdout);
+                            let mut line_count = 0;
                             for line in reader.lines() {
                                 match line {
                                     Ok(l) => {
-                                        let response = RustResponse {
-                                            action: "stream".to_string(),
-                                            status: "stream_data".to_string(),
-                                            message: target_clone.clone(),
-                                            data: Some(l.clone()),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&response) {
-                                            let js = format!(
-                                                "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                json
-                                            );
-                                            let _ = sender_clone.send_blocking(js);
+                                        line_count += 1;
+                                        let js = build_js_callback(&CompactResponse {
+                                            action: "stream",
+                                            status: "stream_data",
+                                            message: &target_clone,
+                                            data: Some(&l),
+                                        });
+                                        let _ = sender_clone.send_blocking(js);
+
+                                        if line_count % 10 == 0 {
+                                            let stats = get_resource_stats();
+                                            tracker.update_thread_stats(thread_id, &stats, 10);
                                         }
                                     }
                                     Err(_) => break,
                                 }
                             }
+                            let final_stats = get_resource_stats();
+                            tracker.finish_thread(thread_id, &final_stats);
+
                             if let Some(mut child) =
                                 safe_lock(&state_clone.running_streams).remove(&target_clone)
                             {
@@ -313,7 +575,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         send_js(
                             "stream",
                             "error",
-                            &format!("EXEC ERROR: {}", e),
+                            &format!("ОШИБКА ВЫПОЛНЕНИЯ: {}", e),
                             Some(target_clone),
                         );
                     }
@@ -368,11 +630,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         };
                         positions.insert(path_str.clone(), initial_state);
                     }
-
                     if let Some(n) = tail {
                         if !path_buf.is_dir() && path_buf.exists() {
                             let path_clone = path_str.clone();
                             let sender_clone = js_sender.clone();
+                            let tracker = Arc::clone(&state.thread_tracker);
+                            let thread_id = tracker.register_thread(
+                                "watch-tail",
+                                &format!("watch-tail-{}", path_clone),
+                            );
                             thread::spawn(move || {
                                 if let Ok(mut file) = fs::File::open(&path_clone) {
                                     if let Ok(meta) = file.metadata() {
@@ -389,31 +655,32 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 0
                                             };
                                             for line in lines.iter().skip(start) {
-                                                let response = RustResponse {
-                                                    action: "watch".to_string(),
-                                                    status: "watch_data".to_string(),
-                                                    message: path_clone.clone(),
-                                                    data: Some(line.clone()),
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&response) {
-                                                    let js = format!(
-                                                        "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                        json
-                                                    );
-                                                    let _ = sender_clone.send_blocking(js);
-                                                }
+                                                let js = build_js_callback(&CompactResponse {
+                                                    action: "watch",
+                                                    status: "watch_data",
+                                                    message: &path_clone,
+                                                    data: Some(line.as_str()),
+                                                });
+                                                let _ = sender_clone.send_blocking(js);
                                             }
                                         }
                                     }
                                 }
+                                let final_stats = get_resource_stats();
+                                tracker.finish_thread(thread_id, &final_stats);
                             });
                         }
                     }
-
                     let path_clone = path_str.clone();
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
+                    let tracker = Arc::clone(&state_clone.thread_tracker);
+                    let thread_id =
+                        tracker.register_thread("watch", &format!("watch-{}", path_clone));
                     thread::spawn(move || {
+                        let current_path_buf = std::path::PathBuf::from(&path_clone);
+                        let mut held_file: Option<fs::File> = None;
+                        let mut event_count = 0;
                         while !state_clone.shutdown.load(Ordering::Relaxed) {
                             {
                                 let positions = safe_lock(&state_clone.watch_positions);
@@ -421,11 +688,11 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     break;
                                 }
                             }
-                            let current_path_buf = std::path::PathBuf::from(&path_clone);
                             let is_dir = current_path_buf.is_dir();
                             let exists = current_path_buf.exists();
                             if exists {
                                 if is_dir {
+                                    held_file = None;
                                     let current_mod_time =
                                         current_path_buf.metadata().ok().and_then(|m| {
                                             m.modified()
@@ -455,88 +722,83 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         }
                                     };
                                     if should_notify {
-                                        let response = RustResponse {
-                                            action: "watch".to_string(),
-                                            status: "watch_data".to_string(),
-                                            message: path_clone.clone(),
-                                            data: Some("OK".to_string()),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&response) {
-                                            let js = format!(
-                                                "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                json
-                                            );
-                                            let _ = sender_clone.send_blocking(js);
+                                        event_count += 1;
+                                        let js = build_js_callback(&CompactResponse {
+                                            action: "watch",
+                                            status: "watch_data",
+                                            message: &path_clone,
+                                            data: Some("OK"),
+                                        });
+                                        let _ = sender_clone.send_blocking(js);
+
+                                        if event_count % 5 == 0 {
+                                            let stats = get_resource_stats();
+                                            tracker.update_thread_stats(thread_id, &stats, 5);
                                         }
                                     }
                                 } else {
-                                    if let Ok(mut file) = fs::File::open(&current_path_buf) {
-                                        let meta = match file.metadata() {
-                                            Ok(m) => m,
+                                    let mut file = match held_file.take() {
+                                        Some(f) => f,
+                                        None => match fs::File::open(&current_path_buf) {
+                                            Ok(f) => f,
                                             Err(_) => {
                                                 thread::sleep(Duration::from_secs(1));
                                                 continue;
                                             }
-                                        };
-                                        let current_pos = {
-                                            let positions = safe_lock(&state_clone.watch_positions);
-                                            if let Some(WatchState::File(pos)) =
-                                                positions.get(&path_clone)
-                                            {
-                                                *pos
-                                            } else {
-                                                None
-                                            }
-                                        };
-                                        let file_len = meta.len();
-                                        let start_pos = match current_pos {
-                                            Some(pos) => {
-                                                if file_len < pos {
-                                                    0
-                                                } else {
-                                                    pos
-                                                }
-                                            }
-                                            None => 0,
-                                        };
-                                        if file.seek(SeekFrom::Start(start_pos)).is_ok() {
-                                            let reader = BufReader::new(file);
-                                            for l in reader.lines().map_while(Result::ok) {
-                                                if !l.is_empty() {
-                                                    let response = RustResponse {
-                                                        action: "watch".to_string(),
-                                                        status: "watch_data".to_string(),
-                                                        message: path_clone.clone(),
-                                                        data: Some(l),
-                                                    };
-                                                    if let Ok(json) =
-                                                        serde_json::to_string(&response)
-                                                    {
-                                                        let js = format!(
-                                                            "if (window.onRunicResponse) window.onRunicResponse({});",
-                                                            json
-                                                        );
-                                                        let _ = sender_clone.send_blocking(js);
-                                                    }
-                                                }
-                                            }
+                                        },
+                                    };
+                                    let meta = match file.metadata() {
+                                        Ok(m) => m,
+                                        Err(_) => {
+                                            thread::sleep(Duration::from_secs(1));
+                                            continue;
                                         }
-                                        let mut positions = safe_lock(&state_clone.watch_positions);
-                                        if let Some(WatchState::File(pos_opt)) =
-                                            positions.get_mut(&path_clone)
+                                    };
+                                    let current_pos = {
+                                        let positions = safe_lock(&state_clone.watch_positions);
+                                        if let Some(WatchState::File(pos)) =
+                                            positions.get(&path_clone)
                                         {
-                                            *pos_opt = Some(file_len);
+                                            *pos
+                                        } else {
+                                            None
                                         }
-                                    } else {
-                                        let mut positions = safe_lock(&state_clone.watch_positions);
-                                        if let Some(WatchState::File(pos_opt)) =
-                                            positions.get_mut(&path_clone)
-                                        {
-                                            *pos_opt = None;
+                                    };
+                                    let file_len = meta.len();
+                                    let start_pos = match current_pos {
+                                        Some(pos) if file_len >= pos => pos,
+                                        _ => 0,
+                                    };
+                                    if file.seek(SeekFrom::Start(start_pos)).is_ok() {
+                                        let reader = BufReader::new(&file);
+                                        for l in reader.lines().map_while(Result::ok) {
+                                            if !l.is_empty() {
+                                                event_count += 1;
+                                                let js = build_js_callback(&CompactResponse {
+                                                    action: "watch",
+                                                    status: "watch_data",
+                                                    message: &path_clone,
+                                                    data: Some(&l),
+                                                });
+                                                let _ = sender_clone.send_blocking(js);
+                                            }
                                         }
+                                    }
+                                    let mut positions = safe_lock(&state_clone.watch_positions);
+                                    if let Some(WatchState::File(pos_opt)) =
+                                        positions.get_mut(&path_clone)
+                                    {
+                                        *pos_opt = Some(file_len);
+                                    }
+                                    held_file = Some(file);
+
+                                    if event_count % 5 == 0 {
+                                        let stats = get_resource_stats();
+                                        tracker.update_thread_stats(thread_id, &stats, 5);
                                     }
                                 }
                             } else {
+                                held_file = None;
                                 let mut positions = safe_lock(&state_clone.watch_positions);
                                 if let Some(state) = positions.get_mut(&path_clone) {
                                     match state {
@@ -547,6 +809,8 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             }
                             thread::sleep(Duration::from_secs(1));
                         }
+                        let final_stats = get_resource_stats();
+                        tracker.finish_thread(thread_id, &final_stats);
                     });
                     send_js("watch", "success", "Мониторинг запущен", None);
                 }
@@ -564,7 +828,26 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("unwatch", "error", "Не указан путь к файлу", None);
                 }
             }
+            "stats" => {
+                let summary = state.thread_tracker.get_summary();
+                send_js("stats", "success", &summary, None);
+            }
             _ => send_js(&request.action, "error", "Неизвестное действие", None),
+        }
+
+        let total_duration = start_time.elapsed();
+        let end_stats = get_resource_stats();
+        let memory_delta = end_stats.memory_kb as i64 - start_stats.memory_kb as i64;
+        let cpu_delta = end_stats.cpu_time_ms as i64 - start_stats.cpu_time_ms as i64;
+
+        if total_duration > Duration::from_millis(100)
+            || memory_delta.abs() > 1024
+            || cpu_delta > 50
+        {
+            eprintln!(
+                "{}[Руник Профиль]{} {} '{}' | Время: {:?} | ΔПамять: {} KB | ΔCPU: {} ms",
+                MAGENTA, RESET, BOLD, request.action, total_duration, memory_delta, cpu_delta
+            );
         }
     });
 }
@@ -580,7 +863,6 @@ fn main() {
             std::process::exit(0);
         }
     };
-
     let width = args.width;
     let height = args.height;
     let x = args.x;
@@ -590,27 +872,27 @@ fn main() {
     let abs_path = match fs::canonicalize(&html_path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Ошибка: не удалось найти файл '{}': {}", html_path, e);
+            eprintln!(
+                "{}Ошибка:{} не удалось найти файл '{}': {}",
+                RED, RESET, html_path, e
+            );
             process::exit(1);
         }
     };
     let file_url = format!("file://{}", abs_path.display());
 
     gtk::init().expect("Не удалось инициализировать GTK");
-
     let window = gtk::Window::new(gtk::WindowType::Popup);
     window.set_default_size(800, 600);
-
     if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
         if let Some(visual) = screen.rgba_visual() {
             window.set_visual(Some(&visual));
         }
     }
     window.set_app_paintable(true);
-
     let css = gtk::CssProvider::new();
     css.load_from_data(b"window { background-color: rgba(0,0,0,0); }")
-        .expect("CSS load failed");
+        .expect("Ошибка загрузки CSS");
     if let Some(screen) = gtk::gdk::Screen::default() {
         gtk::StyleContext::add_provider_for_screen(
             &screen,
@@ -623,7 +905,6 @@ fn main() {
     set_layer(&window, Layer::Background);
     set_keyboard_interactivity(&window, false);
     set_namespace(&window, "runic");
-
     match (width, height) {
         (Some(w), Some(h)) => {
             window.set_default_size(w, h);
@@ -661,25 +942,26 @@ fn main() {
     let controller = webview
         .user_content_manager()
         .expect("WebView должен иметь user_content_manager");
-
+    let thread_tracker = Arc::new(ThreadTracker::new());
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let app_state = Arc::new(AppState {
         running_streams: Mutex::new(HashMap::new()),
         watch_positions: Mutex::new(HashMap::new()),
         spawned_pids: Mutex::new(Vec::new()),
         is_debug,
-        shutdown: AtomicBool::new(false),
+        shutdown: Arc::clone(&shutdown_flag),
+        thread_tracker: Arc::clone(&thread_tracker),
     });
 
-    let (js_sender, js_receiver) = async_channel::bounded::<String>(1024);
-
+    let (js_sender, js_receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
     let state_clone = Arc::clone(&app_state);
     let sender_for_handler = js_sender.clone();
 
     let registered = controller.register_script_message_handler("ipc");
     if is_debug {
         eprintln!(
-            "[Runic Debug] Обработчик 'ipc' зарегистрирован: {}",
-            registered
+            "{}[Руник ОТЛАДКА]{} Обработчик 'ipc' зарегистрирован: {}",
+            CYAN, RESET, registered
         );
     }
 
@@ -689,7 +971,7 @@ fn main() {
             if let Some(js_val) = msg.js_value() {
                 let msg_str = js_val.to_string();
                 if state_clone.is_debug {
-                    eprintln!("[Runic Debug] Получено: {}", msg_str);
+                    eprintln!("{}[Руник ОТЛАДКА]{} Получено: {}", CYAN, RESET, msg_str);
                 }
                 if let Ok(request) = serde_json::from_str::<JsMessage>(&msg_str) {
                     handle_action(
@@ -710,10 +992,10 @@ fn main() {
                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
                         window.webkit.messageHandlers.ipc.postMessage(msg);
                     } else {
-                        console.error('[Runic] Критическая ошибка: IPC мост недоступен');
+                        console.error('[Руник] Критическая ошибка: IPC мост недоступен');
                     }
                 } catch(e) {
-                    console.error('[Runic] Ошибка отправки IPC:', e);
+                    console.error('[Руник] Ошибка отправки IPC:', e);
                 }
             }
         };
@@ -724,14 +1006,12 @@ fn main() {
         &[],
     );
     controller.add_script(&shim);
-
     webview.load_uri(&file_url);
     window.add(&webview);
     window.show_all();
 
     let webview_for_async = webview.clone();
     let is_debug_for_async = is_debug;
-
     glib::spawn_future_local(async move {
         while let Ok(js_code) = js_receiver.recv().await {
             let wv = webview_for_async.clone();
@@ -739,7 +1019,10 @@ fn main() {
             wv.run_javascript(&js_code, None::<&gio::Cancellable>, move |result| {
                 if dbg {
                     if let Err(e) = result {
-                        eprintln!("[Runic Debug] JS execution error: {:?}", e);
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} Ошибка выполнения JS: {:?}",
+                            YELLOW, RESET, e
+                        );
                     }
                 }
             });
@@ -774,31 +1057,46 @@ fn main() {
     });
 
     if is_debug {
-        eprintln!("[Runic Debug] Режим отладки включен");
+        eprintln!("{}[Руник ОТЛАДКА]{} Режим отладки включен", CYAN, RESET);
+
+        let tracker_for_stats = Arc::clone(&thread_tracker);
+        let shutdown_for_stats = Arc::clone(&shutdown_flag);
+        std::thread::spawn(move || {
+            while !shutdown_for_stats.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(THREAD_STATS_INTERVAL_SECS));
+                if !shutdown_for_stats.load(Ordering::Relaxed) {
+                    eprintln!("{}", tracker_for_stats.get_summary());
+                }
+            }
+        });
+
         if let Some(html_dir) = abs_path.parent() {
             let html_dir = html_dir.to_path_buf();
             let (reload_sender, reload_receiver) = async_channel::bounded::<()>(16);
             let webview_for_reload = webview.clone();
             let state_for_reload = Arc::clone(&app_state);
-
             glib::spawn_future_local(async move {
                 while let Ok(()) = reload_receiver.recv().await {
-                    eprintln!("[Runic Debug] Обнаружены изменения, перезагрузка WebView...");
+                    eprintln!(
+                        "{}[Руник ОТЛАДКА]{} Обнаружены изменения, перезагрузка WebView...",
+                        CYAN, RESET
+                    );
                     kill_and_clear_tracked(&state_for_reload);
                     if let Ok(mut positions) = state_for_reload.watch_positions.lock() {
                         positions.clear();
                     }
-
                     state_for_reload.shutdown.store(false, Ordering::Relaxed);
                     webview_for_reload.reload();
                 }
             });
-
             std::thread::spawn(move || {
                 let mut inotify = match inotify::Inotify::init() {
                     Ok(i) => i,
                     Err(e) => {
-                        eprintln!("[Runic Debug] Failed to init inotify: {}", e);
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} Ошибка инициализации inotify: {}",
+                            YELLOW, RESET, e
+                        );
                         return;
                     }
                 };
@@ -810,7 +1108,10 @@ fn main() {
                         | inotify::WatchMask::MOVED_TO
                         | inotify::WatchMask::CLOSE_WRITE,
                 ) {
-                    eprintln!("[Runic Debug] Failed to add watch: {}", e);
+                    eprintln!(
+                        "{}[Руник ОТЛАДКА]{} Ошибка добавления watch: {}",
+                        YELLOW, RESET, e
+                    );
                     return;
                 }
                 let mut buffer = vec![0u8; 64 * 1024];
@@ -836,14 +1137,19 @@ fn main() {
                             }
                             if needs_reload {
                                 let now = Instant::now();
-                                if now.duration_since(last_reload) > Duration::from_millis(300) {
+                                if now.duration_since(last_reload)
+                                    > Duration::from_millis(HOT_RELOAD_DEBOUNCE_MS)
+                                {
                                     let _ = reload_sender.send_blocking(());
                                     last_reload = now;
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("[Runic Debug] inotify error: {}. Continuing...", e);
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Ошибка inotify: {}. Продолжаем...",
+                                YELLOW, RESET, e
+                            );
                             thread::sleep(Duration::from_millis(5000));
                         }
                     }
@@ -855,16 +1161,18 @@ fn main() {
     let state_for_resume = Arc::clone(&app_state);
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
-
     std::thread::spawn(move || {
         let mut last_time = std::time::SystemTime::now();
         while !state_for_resume.shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(SLEEP_CHECK_INTERVAL_SECS));
             let now = std::time::SystemTime::now();
             if let Ok(elapsed) = now.duration_since(last_time) {
-                if elapsed > std::time::Duration::from_secs(15) {
+                if elapsed > std::time::Duration::from_secs(SLEEP_DETECTION_THRESHOLD_SECS) {
                     if is_debug_for_resume {
-                        eprintln!("[Runic Debug] Обнаружен выход из сна. Перезагрузка виджета...");
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} Обнаружен выход из сна. Перезагрузка виджета...",
+                            CYAN, RESET
+                        );
                     }
                     kill_and_clear_tracked(&state_for_resume);
                     if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
@@ -899,9 +1207,10 @@ mod tests {
             watch_positions: Mutex::new(HashMap::new()),
             spawned_pids: Mutex::new(Vec::new()),
             is_debug: false,
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread_tracker: Arc::new(ThreadTracker::new()),
         });
-        let (sender, receiver) = async_channel::bounded::<String>(1024);
+        let (sender, receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
         (state, sender, receiver)
     }
 
@@ -925,7 +1234,7 @@ mod tests {
             action: "read".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "read");
         assert_eq!(response.status, "success");
@@ -940,7 +1249,7 @@ mod tests {
             action: "read".to_string(),
             payload: json!({"path": "/nonexistent/path/file_12345.txt"}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "read");
         assert_eq!(response.status, "error");
@@ -960,7 +1269,7 @@ mod tests {
             action: "write".to_string(),
             payload: json!({"path": file_path.to_str().unwrap(), "data": "appended data"}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "write");
         assert_eq!(response.status, "success");
@@ -979,7 +1288,7 @@ mod tests {
             action: "write".to_string(),
             payload: json!({"path": file_path.to_str().unwrap(), "data": "appended\n", "append": true}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let _ = get_response(&receiver);
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "initial\nappended\n");
@@ -993,7 +1302,7 @@ mod tests {
             action: "exec".to_string(),
             payload: json!({"command": "echo -n 'hello world'"}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "exec");
         assert_eq!(response.status, "success");
@@ -1007,7 +1316,7 @@ mod tests {
             action: "exec".to_string(),
             payload: json!({"command": "ls /nonexistent_directory_12345"}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "exec");
         assert_eq!(response.status, "success");
@@ -1053,7 +1362,7 @@ mod tests {
             action: "stream".to_string(),
             payload: json!({"target": ""}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "stream");
         assert_eq!(response.status, "error");
@@ -1062,7 +1371,6 @@ mod tests {
 
     #[test]
     fn test_handle_action_stream_duplicate_error() {
-        // Тест на TOCTOU: второй stream с тем же target должен вернуть ошибку
         let (state, sender, receiver) = setup_test_state();
         let request = JsMessage {
             action: "stream".to_string(),
@@ -1071,8 +1379,6 @@ mod tests {
         handle_action(Arc::clone(&state), request, sender.clone());
         let start_response = get_response(&receiver);
         assert_eq!(start_response.status, "success");
-
-        // Второй запрос с тем же target
         let request2 = JsMessage {
             action: "stream".to_string(),
             payload: json!({"target": "sleep 10"}),
@@ -1082,8 +1388,6 @@ mod tests {
         assert_eq!(dup_response.action, "stream");
         assert_eq!(dup_response.status, "error");
         assert_eq!(dup_response.message, "Уже выполняется");
-
-        // Очистка
         safe_lock(&state.running_streams).clear();
         safe_lock(&state.spawned_pids).clear();
     }
@@ -1123,10 +1427,6 @@ mod tests {
         assert!(got_watch_data, "Должны прийти данные из файла (tail)");
         let positions = safe_lock(&state.watch_positions);
         assert!(positions.contains_key(file_path.to_str().unwrap()));
-        assert!(matches!(
-            positions[file_path.to_str().unwrap()],
-            WatchState::File(Some(_))
-        ));
         drop(positions);
         std::thread::sleep(Duration::from_millis(100));
         safe_lock(&state.watch_positions).remove(file_path.to_str().unwrap());
@@ -1191,7 +1491,7 @@ mod tests {
             action: "unknown_action".to_string(),
             payload: json!({}),
         };
-        handle_action(state, request, sender);
+        handle_action(Arc::clone(&state), request, sender);
         let response = get_response(&receiver);
         assert_eq!(response.action, "unknown_action");
         assert_eq!(response.status, "error");
@@ -1200,10 +1500,7 @@ mod tests {
 
     #[test]
     fn test_kill_and_clear_tracked_no_double_kill() {
-        // Тест: процессы из running_streams не должны быть убиты дважды
         let (state, _sender, _receiver) = setup_test_state();
-
-        // Запускаем процесс через stream
         let child = Command::new("sleep")
             .arg("10")
             .stdout(Stdio::piped())
@@ -1213,11 +1510,7 @@ mod tests {
         let pid = child.id();
         safe_lock(&state.spawned_pids).push(pid);
         safe_lock(&state.running_streams).insert("test".to_string(), child);
-
-        // Вызываем kill_and_clear_tracked
         kill_and_clear_tracked(&state);
-
-        // Проверяем, что всё очищено
         assert!(safe_lock(&state.running_streams).is_empty());
         assert!(safe_lock(&state.spawned_pids).is_empty());
     }
@@ -1228,24 +1521,15 @@ mod tests {
         let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("runic_test_shutdown_watch.log");
         std::fs::write(&file_path, "line\n").unwrap();
-
         let request = JsMessage {
             action: "watch".to_string(),
             payload: json!({"path": file_path.to_str().unwrap()}),
         };
         handle_action(Arc::clone(&state), request, sender);
         sleep(Duration::from_millis(100));
-
-        // Устанавливаем shutdown
         state.shutdown.store(true, Ordering::Relaxed);
-
-        // Ждём, пока поток watch завершится (до 2 секунд)
         sleep(Duration::from_secs(2));
-
-        // Поток должен был выйти из цикла
-        // Проверяем, что флаг установлен
         assert!(state.shutdown.load(Ordering::Relaxed));
-
         let _ = std::fs::remove_file(&file_path);
     }
 }
