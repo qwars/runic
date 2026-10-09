@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use webkit2gtk::{
     SettingsExt, UserContentInjectedFrames, UserContentManagerExt, UserScript,
     UserScriptInjectionTime, WebView, WebViewExt,
@@ -26,15 +27,51 @@ const HOT_RELOAD_DEBOUNCE_MS: u64 = 300;
 const SLEEP_DETECTION_THRESHOLD_SECS: u64 = 15;
 const SLEEP_CHECK_INTERVAL_SECS: u64 = 5;
 const THREAD_STATS_INTERVAL_SECS: u64 = 30;
+const DIR_WATCH_DEBOUNCE_MS: u64 = 500;
+const THREAD_POOL_SIZE: usize = 8;
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const STREAM_STATS_BATCH: u64 = 10;
+const WATCH_STATS_BATCH: u64 = 5;
+const TAIL_BUF_LIMIT: u64 = 64 * 1024;
 
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
-// const BLUE: &str = "\x1b[34m";
 const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
 const BOLD: &str = "\x1b[1m";
+
+type Task = Box<dyn FnOnce() + Send + 'static>;
+
+struct ThreadPool {
+    sender: std::sync::mpsc::Sender<Task>,
+    _workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    fn new(size: usize) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<Task>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(size);
+        for _ in 0..size {
+            let receiver = Arc::clone(&receiver);
+            workers.push(thread::spawn(move || {
+                while let Ok(task) = receiver.lock().unwrap().recv() {
+                    task();
+                }
+            }));
+        }
+        Self {
+            sender,
+            _workers: workers,
+        }
+    }
+
+    fn execute<F: FnOnce() + Send + 'static>(&self, f: F) {
+        let _ = self.sender.send(Box::new(f));
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "runic", about = "HTML-виджет для рабочего стола")]
@@ -99,8 +136,8 @@ struct ThreadStats {
     id: u64,
     thread_type: String,
     name: String,
-    created_at: SystemTime,
-    finished_at: Option<SystemTime>,
+    created_at: Instant,
+    finished_at: Option<Instant>,
     peak_memory_kb: u64,
     cpu_time_ms: u128,
     tasks_completed: u64,
@@ -129,7 +166,7 @@ impl ThreadTracker {
             id,
             thread_type: thread_type.to_string(),
             name: name.to_string(),
-            created_at: SystemTime::now(),
+            created_at: Instant::now(),
             finished_at: None,
             peak_memory_kb: 0,
             cpu_time_ms: 0,
@@ -142,14 +179,14 @@ impl ThreadTracker {
 
     fn finish_thread(&self, id: u64, final_stats: &ResourceStats) {
         if let Some(stats) = self.threads.lock().unwrap().get_mut(&id) {
-            stats.finished_at = Some(SystemTime::now());
+            stats.finished_at = Some(Instant::now());
             stats.peak_memory_kb = final_stats.memory_kb;
             stats.cpu_time_ms = final_stats.cpu_time_ms;
         }
         self.total_finished.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn update_thread_stats(&self, id: u64, stats: &ResourceStats, tasks: u64) {
+    fn update_thread_statistics(&self, id: u64, stats: &ResourceStats, tasks: u64) {
         if let Some(thread_stats) = self.threads.lock().unwrap().get_mut(&id) {
             thread_stats.peak_memory_kb = thread_stats.peak_memory_kb.max(stats.memory_kb);
             thread_stats.cpu_time_ms = stats.cpu_time_ms;
@@ -168,7 +205,7 @@ impl ThreadTracker {
         summary += &format!("Создано всего: {}\n", total_created);
         summary += &format!("Завершено: {}\n", total_finished);
         summary += &format!("Активных: {}\n", active);
-        summary += &format!("Завершенных в истории: {}\n\n", finished);
+        summary += &format!("Завершённых в истории: {}\n\n", finished);
 
         if active > 0 {
             summary += &format!("{}Активные потоки:{}\n", GREEN, RESET);
@@ -178,25 +215,19 @@ impl ThreadTracker {
                     stats.id,
                     stats.name,
                     stats.thread_type,
-                    SystemTime::now()
-                        .duration_since(stats.created_at)
-                        .unwrap_or_default()
+                    stats.created_at.elapsed()
                 );
             }
         }
 
-        summary += &format!("\n{}Последние 5 завершенных:{}\n", YELLOW, RESET);
+        summary += &format!("\n{}Последние 5 завершённых:{}\n", YELLOW, RESET);
         let mut finished_threads: Vec<_> = threads
             .values()
             .filter(|t| t.finished_at.is_some())
             .collect();
         finished_threads.sort_by_key(|a| std::cmp::Reverse(a.finished_at));
         for stats in finished_threads.iter().take(5) {
-            let duration = stats
-                .finished_at
-                .unwrap()
-                .duration_since(stats.created_at)
-                .unwrap_or_default();
+            let duration = stats.finished_at.unwrap().duration_since(stats.created_at);
             summary += &format!(
                 "  [{}] {} ({}) - работал {:?}, пик памяти: {} KB, CPU: {} ms, задач: {}\n",
                 stats.id,
@@ -208,7 +239,6 @@ impl ThreadTracker {
                 stats.tasks_completed
             );
         }
-
         summary
     }
 }
@@ -220,6 +250,7 @@ struct AppState {
     is_debug: bool,
     shutdown: Arc<AtomicBool>,
     thread_tracker: Arc<ThreadTracker>,
+    pool: Arc<ThreadPool>,
 }
 
 fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -232,6 +263,7 @@ fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     })
 }
 
+#[derive(Copy, Clone)]
 struct ResourceStats {
     memory_kb: u64,
     cpu_time_ms: u128,
@@ -297,28 +329,28 @@ fn cleanup_children(state: &Arc<AppState>) {
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM процессу {}",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM группе процессов -{}",
                 CYAN, RESET, pid
             );
         }
     }
     for &pid in &pids {
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            libc::kill(-(pid as i32), libc::SIGTERM);
         }
     }
     std::thread::sleep(Duration::from_millis(300));
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL процессу {}",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL группе процессов -{}",
                 CYAN, RESET, pid
             );
         }
     }
     for &pid in &pids {
         unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+            libc::kill(-(pid as i32), libc::SIGKILL);
             let mut status: libc::c_int = 0;
             libc::waitpid(pid as libc::pid_t, &mut status, 0);
         }
@@ -346,7 +378,7 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
             let pid = child.id();
             killed_pids.push(pid);
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                libc::kill(-(pid as i32), libc::SIGKILL);
                 let mut status: libc::c_int = 0;
                 libc::waitpid(pid as libc::pid_t, &mut status, 0);
             }
@@ -357,7 +389,7 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
         pids.retain(|p| !killed_pids.contains(p));
         for &pid in pids.iter() {
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                libc::kill(-(pid as i32), libc::SIGKILL);
                 let mut status: libc::c_int = 0;
                 libc::waitpid(pid as libc::pid_t, &mut status, 0);
             }
@@ -383,10 +415,16 @@ fn build_js_callback(response: &CompactResponse) -> String {
 }
 
 fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<String>) {
+    let is_debug = state.is_debug;
     let start_time = Instant::now();
-    let start_stats = get_resource_stats();
+    let start_stats = if is_debug {
+        Some(get_resource_stats())
+    } else {
+        None
+    };
+    let pool = Arc::clone(&state.pool);
 
-    thread::spawn(move || {
+    pool.execute(move || {
         let send_js = |action: &str, status: &str, message: &str, data: Option<String>| {
             let response = RustResponse {
                 action: action.to_string(),
@@ -399,7 +437,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     "if (window.onRunicResponse) window.onRunicResponse({});",
                     json
                 );
-                let _ = js_sender.send_blocking(js);
+                let _ = js_sender.try_send(js);
             }
         };
 
@@ -452,12 +490,20 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             "exec" => {
                 if let Some(cmd) = request.payload.get("command").and_then(|v| v.as_str()) {
                     let exec_start = Instant::now();
-                    match Command::new("sh").arg("-c").arg(cmd).output() {
+                    let mut cmd_obj = Command::new("sh");
+                    cmd_obj.arg("-c").arg(cmd);
+                    unsafe {
+                        cmd_obj.pre_exec(|| {
+                            libc::setpgid(0, 0);
+                            Ok(())
+                        });
+                    }
+                    match cmd_obj.output() {
                         Ok(out) => {
-                            let exec_duration = exec_start.elapsed();
-                            let exec_stats = get_resource_stats();
-                            log_profile("exec", exec_duration, &exec_stats);
-
+                            if is_debug {
+                                let exec_stats = get_resource_stats();
+                                log_profile("exec", exec_start.elapsed(), &exec_stats);
+                            }
                             let stdout = String::from_utf8(out.stdout).unwrap_or_else(|e| {
                                 String::from_utf8_lossy(e.as_bytes()).into_owned()
                             });
@@ -495,6 +541,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .arg(&target_clone)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
+                unsafe {
+                    cmd_obj.pre_exec(|| {
+                        libc::setpgid(0, 0);
+                        Ok(())
+                    });
+                }
                 let mut running = safe_lock(&state.running_streams);
                 if running.contains_key(&target) {
                     send_js("stream", "error", "Уже выполняется", None);
@@ -518,13 +570,16 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         let stderr = proc.stderr.take();
                         running.insert(target_clone.clone(), proc);
                         drop(running);
+
+                        send_js("stream", "success", "Запущен", None);
+
                         if let Some(stderr_pipe) = stderr {
                             let target_for_stderr = target_clone.clone();
-                            let is_debug = state_clone.is_debug;
+                            let is_debug_stderr = state_clone.is_debug;
                             thread::spawn(move || {
                                 let reader = BufReader::new(stderr_pipe);
                                 for l in reader.lines().map_while(Result::ok) {
-                                    if is_debug {
+                                    if is_debug_stderr {
                                         eprintln!(
                                             "{}[Руник STDERR]{}[{}] {}",
                                             RED, RESET, target_for_stderr, l
@@ -534,6 +589,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             });
                         }
                         let tracker = Arc::clone(&state_clone.thread_tracker);
+                        let is_debug_stream = state_clone.is_debug;
                         thread::spawn(move || {
                             let reader = BufReader::new(stdout);
                             let mut line_count = 0;
@@ -547,19 +603,23 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             message: &target_clone,
                                             data: Some(&l),
                                         });
-                                        let _ = sender_clone.send_blocking(js);
-
-                                        if line_count % 10 == 0 {
+                                        let _ = sender_clone.try_send(js);
+                                        if is_debug_stream && line_count % STREAM_STATS_BATCH == 0 {
                                             let stats = get_resource_stats();
-                                            tracker.update_thread_stats(thread_id, &stats, 10);
+                                            tracker.update_thread_statistics(
+                                                thread_id,
+                                                &stats,
+                                                STREAM_STATS_BATCH,
+                                            );
                                         }
                                     }
                                     Err(_) => break,
                                 }
                             }
-                            let final_stats = get_resource_stats();
-                            tracker.finish_thread(thread_id, &final_stats);
-
+                            if is_debug_stream {
+                                let final_stats = get_resource_stats();
+                                tracker.finish_thread(thread_id, &final_stats);
+                            }
                             if let Some(mut child) =
                                 safe_lock(&state_clone.running_streams).remove(&target_clone)
                             {
@@ -568,7 +628,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 pids.retain(|&p| p != child.id());
                             }
                         });
-                        send_js("stream", "success", "Запущен", None);
                     }
                     Err(e) => {
                         drop(running);
@@ -591,7 +650,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                 if let Some(child) = running.remove(target) {
                     let pid = child.id();
                     unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
+                        libc::kill(-(pid as i32), libc::SIGKILL);
                         let mut status: libc::c_int = 0;
                         libc::waitpid(pid as libc::pid_t, &mut status, 0);
                     }
@@ -635,6 +694,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             let path_clone = path_str.clone();
                             let sender_clone = js_sender.clone();
                             let tracker = Arc::clone(&state.thread_tracker);
+                            let is_debug_tail = state.is_debug;
                             let thread_id = tracker.register_thread(
                                 "watch-tail",
                                 &format!("watch-tail-{}", path_clone),
@@ -644,7 +704,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     if let Ok(meta) = file.metadata() {
                                         let file_len = meta.len();
                                         if file_len > 0 {
-                                            let read_size = std::cmp::min(file_len, 64 * 1024);
+                                            let read_size = std::cmp::min(file_len, TAIL_BUF_LIMIT);
                                             let _ = file.seek(SeekFrom::End(-(read_size as i64)));
                                             let reader = BufReader::new(file);
                                             let lines: Vec<String> =
@@ -661,13 +721,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                     message: &path_clone,
                                                     data: Some(line.as_str()),
                                                 });
-                                                let _ = sender_clone.send_blocking(js);
+                                                let _ = sender_clone.try_send(js);
                                             }
                                         }
                                     }
                                 }
-                                let final_stats = get_resource_stats();
-                                tracker.finish_thread(thread_id, &final_stats);
+                                if is_debug_tail {
+                                    let final_stats = get_resource_stats();
+                                    tracker.finish_thread(thread_id, &final_stats);
+                                }
                             });
                         }
                     }
@@ -675,12 +737,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
                     let tracker = Arc::clone(&state_clone.thread_tracker);
+                    let is_debug_watch = state_clone.is_debug;
                     let thread_id =
                         tracker.register_thread("watch", &format!("watch-{}", path_clone));
                     thread::spawn(move || {
                         let current_path_buf = std::path::PathBuf::from(&path_clone);
                         let mut held_file: Option<fs::File> = None;
                         let mut event_count = 0;
+                        let mut last_dir_notification = Instant::now();
                         while !state_clone.shutdown.load(Ordering::Relaxed) {
                             {
                                 let positions = safe_lock(&state_clone.watch_positions);
@@ -722,18 +786,29 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         }
                                     };
                                     if should_notify {
-                                        event_count += 1;
-                                        let js = build_js_callback(&CompactResponse {
-                                            action: "watch",
-                                            status: "watch_data",
-                                            message: &path_clone,
-                                            data: Some("OK"),
-                                        });
-                                        let _ = sender_clone.send_blocking(js);
-
-                                        if event_count % 5 == 0 {
-                                            let stats = get_resource_stats();
-                                            tracker.update_thread_stats(thread_id, &stats, 5);
+                                        let now = Instant::now();
+                                        if now.duration_since(last_dir_notification)
+                                            > Duration::from_millis(DIR_WATCH_DEBOUNCE_MS)
+                                        {
+                                            event_count += 1;
+                                            let js = build_js_callback(&CompactResponse {
+                                                action: "watch",
+                                                status: "watch_data",
+                                                message: &path_clone,
+                                                data: Some("OK"),
+                                            });
+                                            let _ = sender_clone.try_send(js);
+                                            last_dir_notification = now;
+                                            if is_debug_watch
+                                                && event_count % WATCH_STATS_BATCH == 0
+                                            {
+                                                let stats = get_resource_stats();
+                                                tracker.update_thread_statistics(
+                                                    thread_id,
+                                                    &stats,
+                                                    WATCH_STATS_BATCH,
+                                                );
+                                            }
                                         }
                                     }
                                 } else {
@@ -742,7 +817,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         None => match fs::File::open(&current_path_buf) {
                                             Ok(f) => f,
                                             Err(_) => {
-                                                thread::sleep(Duration::from_secs(1));
+                                                thread::sleep(WATCH_POLL_INTERVAL);
                                                 continue;
                                             }
                                         },
@@ -750,7 +825,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     let meta = match file.metadata() {
                                         Ok(m) => m,
                                         Err(_) => {
-                                            thread::sleep(Duration::from_secs(1));
+                                            thread::sleep(WATCH_POLL_INTERVAL);
                                             continue;
                                         }
                                     };
@@ -780,7 +855,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                     message: &path_clone,
                                                     data: Some(&l),
                                                 });
-                                                let _ = sender_clone.send_blocking(js);
+                                                let _ = sender_clone.try_send(js);
                                             }
                                         }
                                     }
@@ -791,10 +866,13 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         *pos_opt = Some(file_len);
                                     }
                                     held_file = Some(file);
-
-                                    if event_count % 5 == 0 {
+                                    if is_debug_watch && event_count % WATCH_STATS_BATCH == 0 {
                                         let stats = get_resource_stats();
-                                        tracker.update_thread_stats(thread_id, &stats, 5);
+                                        tracker.update_thread_statistics(
+                                            thread_id,
+                                            &stats,
+                                            WATCH_STATS_BATCH,
+                                        );
                                     }
                                 }
                             } else {
@@ -807,10 +885,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     }
                                 }
                             }
-                            thread::sleep(Duration::from_secs(1));
+                            thread::sleep(WATCH_POLL_INTERVAL);
                         }
-                        let final_stats = get_resource_stats();
-                        tracker.finish_thread(thread_id, &final_stats);
+                        if is_debug_watch {
+                            let final_stats = get_resource_stats();
+                            tracker.finish_thread(thread_id, &final_stats);
+                        }
                     });
                     send_js("watch", "success", "Мониторинг запущен", None);
                 }
@@ -835,19 +915,28 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
             _ => send_js(&request.action, "error", "Неизвестное действие", None),
         }
 
-        let total_duration = start_time.elapsed();
-        let end_stats = get_resource_stats();
-        let memory_delta = end_stats.memory_kb as i64 - start_stats.memory_kb as i64;
-        let cpu_delta = end_stats.cpu_time_ms as i64 - start_stats.cpu_time_ms as i64;
-
-        if total_duration > Duration::from_millis(100)
-            || memory_delta.abs() > 1024
-            || cpu_delta > 50
-        {
-            eprintln!(
-                "{}[Руник Профиль]{} {} '{}' | Время: {:?} | ΔПамять: {} KB | ΔCPU: {} ms",
-                MAGENTA, RESET, BOLD, request.action, total_duration, memory_delta, cpu_delta
-            );
+        if is_debug {
+            if let Some(ss) = start_stats {
+                let total_duration = start_time.elapsed();
+                let end_stats = get_resource_stats();
+                let memory_delta = end_stats.memory_kb as i64 - ss.memory_kb as i64;
+                let cpu_delta = end_stats.cpu_time_ms as i64 - ss.cpu_time_ms as i64;
+                if total_duration > Duration::from_millis(100)
+                    || memory_delta.abs() > 1024
+                    || cpu_delta > 50
+                {
+                    eprintln!(
+                        "{}[Руник Профиль]{} {} '{}' | Время: {:?} | ΔПамять: {} KB | ΔCPU: {} ms",
+                        MAGENTA,
+                        RESET,
+                        BOLD,
+                        request.action,
+                        total_duration,
+                        memory_delta,
+                        cpu_delta
+                    );
+                }
+            }
         }
     });
 }
@@ -944,6 +1033,7 @@ fn main() {
         .expect("WebView должен иметь user_content_manager");
     let thread_tracker = Arc::new(ThreadTracker::new());
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let pool = Arc::new(ThreadPool::new(THREAD_POOL_SIZE));
     let app_state = Arc::new(AppState {
         running_streams: Mutex::new(HashMap::new()),
         watch_positions: Mutex::new(HashMap::new()),
@@ -951,6 +1041,7 @@ fn main() {
         is_debug,
         shutdown: Arc::clone(&shutdown_flag),
         thread_tracker: Arc::clone(&thread_tracker),
+        pool: Arc::clone(&pool),
     });
 
     let (js_sender, js_receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
@@ -1114,7 +1205,7 @@ fn main() {
                     );
                     return;
                 }
-                let mut buffer = vec![0u8; 64 * 1024];
+                let mut buffer = vec![0u8; TAIL_BUF_LIMIT as usize];
                 let mut last_reload = Instant::now();
                 loop {
                     match inotify.read_events_blocking(&mut buffer) {
@@ -1162,26 +1253,24 @@ fn main() {
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
     std::thread::spawn(move || {
-        let mut last_time = std::time::SystemTime::now();
+        let mut last_time = Instant::now();
         while !state_for_resume.shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(SLEEP_CHECK_INTERVAL_SECS));
-            let now = std::time::SystemTime::now();
-            if let Ok(elapsed) = now.duration_since(last_time) {
-                if elapsed > std::time::Duration::from_secs(SLEEP_DETECTION_THRESHOLD_SECS) {
-                    if is_debug_for_resume {
-                        eprintln!(
-                            "{}[Руник ОТЛАДКА]{} Обнаружен выход из сна. Перезагрузка виджета...",
-                            CYAN, RESET
-                        );
-                    }
-                    kill_and_clear_tracked(&state_for_resume);
-                    if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
-                        positions.clear();
-                    }
-                    state_for_resume.shutdown.store(false, Ordering::Relaxed);
-                    let _ =
-                        js_sender_for_resume.send_blocking("window.location.reload();".to_string());
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_time);
+            if elapsed > std::time::Duration::from_secs(SLEEP_DETECTION_THRESHOLD_SECS) {
+                if is_debug_for_resume {
+                    eprintln!(
+                        "{}[Руник ОТЛАДКА]{} Обнаружен выход из сна. Перезагрузка виджета...",
+                        CYAN, RESET
+                    );
                 }
+                kill_and_clear_tracked(&state_for_resume);
+                if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
+                    positions.clear();
+                }
+                state_for_resume.shutdown.store(false, Ordering::Relaxed);
+                let _ = js_sender_for_resume.try_send("window.location.reload();".to_string());
             }
             last_time = now;
         }
@@ -1209,6 +1298,7 @@ mod tests {
             is_debug: false,
             shutdown: Arc::new(AtomicBool::new(false)),
             thread_tracker: Arc::new(ThreadTracker::new()),
+            pool: Arc::new(ThreadPool::new(THREAD_POOL_SIZE)),
         });
         let (sender, receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
         (state, sender, receiver)
@@ -1345,13 +1435,13 @@ mod tests {
         let running = safe_lock(&state.running_streams);
         assert!(
             running.is_empty(),
-            "Поток должен быть удален из running_streams"
+            "Поток должен быть удалён из running_streams"
         );
         drop(running);
         let pids = safe_lock(&state.spawned_pids);
         assert!(
             pids.is_empty(),
-            "PID должен быть удален из spawned_pids после завершения"
+            "PID должен быть удалён из spawned_pids после завершения"
         );
     }
 
@@ -1405,8 +1495,8 @@ mod tests {
         handle_action(Arc::clone(&state), request, sender);
         let mut got_success = false;
         let mut got_watch_data = false;
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_millis(200) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(200) {
             match receiver.try_recv() {
                 Ok(js_code) => {
                     let json_str = js_code
@@ -1420,7 +1510,7 @@ mod tests {
                         }
                     }
                 }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
         assert!(got_success, "Должно прийти подтверждение запуска watch");
