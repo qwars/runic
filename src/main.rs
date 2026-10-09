@@ -117,7 +117,6 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
     eprintln!("[Runic Debug] === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ===");
     state.shutdown.store(true, Ordering::Relaxed);
 
-    // Сначала убиваем процессы из running_streams и собираем их PID
     let mut killed_pids = Vec::new();
     {
         let mut streams = safe_lock(&state.running_streams);
@@ -132,7 +131,6 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
         }
     }
 
-    // Затем убиваем оставшиеся PID, исключая уже убитые
     {
         let mut pids = safe_lock(&state.spawned_pids);
         pids.retain(|p| !killed_pids.contains(p));
@@ -252,8 +250,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .arg(&target_clone)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
-
-                // ИСПРАВЛЕНО: один лок от проверки до вставки (устранён TOCTOU)
                 let mut running = safe_lock(&state.running_streams);
                 if running.contains_key(&target) {
                     send_js("stream", "error", "Уже выполняется", None);
@@ -268,7 +264,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         let stdout = proc.stdout.take().unwrap();
                         let stderr = proc.stderr.take();
                         running.insert(target_clone.clone(), proc);
-                        drop(running); // Отпускаем лок перед spawn потоков чтения
+                        drop(running);
 
                         if let Some(stderr_pipe) = stderr {
                             let target_for_stderr = target_clone.clone();
@@ -302,7 +298,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     Err(_) => break,
                                 }
                             }
-                            // Предотвращение зомби при естественном завершении
                             if let Some(mut child) =
                                 safe_lock(&state_clone.running_streams).remove(&target_clone)
                             {
@@ -419,7 +414,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
                     thread::spawn(move || {
-                        // ИСПРАВЛЕНО: проверка shutdown для чистой остановки
                         while !state_clone.shutdown.load(Ordering::Relaxed) {
                             {
                                 let positions = safe_lock(&state_clone.watch_positions);
@@ -453,7 +447,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 false
                                             }
                                         } else {
-                                            // ИСПРАВЛЕНО: insert вместо unwrap (устранена паника)
                                             positions.insert(
                                                 path_clone.clone(),
                                                 WatchState::Dir(current_mod_time),
@@ -608,7 +601,6 @@ fn main() {
     let window = gtk::Window::new(gtk::WindowType::Popup);
     window.set_default_size(800, 600);
 
-    // ИСПРАВЛЕНО: let chains → вложенные if (совместимость с MSRV < 1.87)
     if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
         if let Some(visual) = screen.rgba_visual() {
             window.set_visual(Some(&visual));
@@ -740,7 +732,6 @@ fn main() {
     let webview_for_async = webview.clone();
     let is_debug_for_async = is_debug;
 
-    // ИСПРАВЛЕНО: логирование ошибок run_javascript в debug-режиме
     glib::spawn_future_local(async move {
         while let Ok(js_code) = js_receiver.recv().await {
             let wv = webview_for_async.clone();
@@ -797,7 +788,7 @@ fn main() {
                     if let Ok(mut positions) = state_for_reload.watch_positions.lock() {
                         positions.clear();
                     }
-                    // Сбрасываем shutdown для продолжения работы после hot-reload
+
                     state_for_reload.shutdown.store(false, Ordering::Relaxed);
                     webview_for_reload.reload();
                 }
@@ -865,7 +856,6 @@ fn main() {
     let js_sender_for_resume = js_sender.clone();
     let is_debug_for_resume = is_debug;
 
-    // ИСПРАВЛЕНО: проверка shutdown для чистой остановки
     std::thread::spawn(move || {
         let mut last_time = std::time::SystemTime::now();
         while !state_for_resume.shutdown.load(Ordering::Relaxed) {
@@ -880,7 +870,6 @@ fn main() {
                     if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
                         positions.clear();
                     }
-                    // Сбрасываем shutdown для продолжения работы после resume
                     state_for_resume.shutdown.store(false, Ordering::Relaxed);
                     let _ =
                         js_sender_for_resume.send_blocking("window.location.reload();".to_string());
