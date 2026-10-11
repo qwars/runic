@@ -219,7 +219,7 @@ function registerWatch(path, handler) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// РЕГИСТРАЦИЯ НАБЛЮДАТЕЛЕЙ (ТОЛЬКО ДЛЯ .streamtitle)
+// РЕГИСТРАЦИЯ НАБЛЮДАТЕЛЕЙ
 // ═══════════════════════════════════════════════════════════════
 
 // Инициализация плеера
@@ -243,6 +243,11 @@ registerWatch("/home/qwars/.cache/evolution/mail", {
     });
   },
 });
+sendToRust("exec", {
+  command: `find /home/qwars/.cache/evolution/mail -name "folders.db" 2>/dev/null | while read db; do
+        sqlite3 "$db" "SELECT COALESCE(SUM(unread_count),0) FROM folders WHERE folder_name LIKE '%Inbox%' OR folder_name LIKE '%INBOX%';" 2>/dev/null
+      done | awk '{sum+=$1} END {print sum+0}'`,
+});
 
 // RSS база Evolution — ТРИГГЕР для exec
 registerWatch("/home/qwars/.local/share/evolution/mail/rss/folders.db", {
@@ -251,6 +256,9 @@ registerWatch("/home/qwars/.local/share/evolution/mail/rss/folders.db", {
       command: `sqlite3 ~/.local/share/evolution/mail/rss/folders.db "SELECT SUM(unread_count) FROM folders;" 2>/dev/null || echo 0`,
     });
   },
+});
+sendToRust("exec", {
+  command: `sqlite3 ~/.local/share/evolution/mail/rss/folders.db "SELECT SUM(unread_count) FROM folders;" 2>/dev/null || echo 0`,
 });
 
 // Org-mode задачи — ТРИГГЕР для exec
@@ -264,8 +272,14 @@ echo $((TODO + OVERDUE))`,
   },
 });
 
+sendToRust("exec", {
+  command: `TODO=$(grep -R 'TODO' ~/.emacs.d/org-tasks/ 2>/dev/null | wc -l)
+OVERDUE=$(grep -R 'DEADLINE:' ~/.emacs.d/org-tasks/ 2>/dev/null | awk -F'DEADLINE: <' '{print $2}' | awk -F'>' -v today="$(date +%Y-%m-%d)" '$1 < today' | wc -l)
+echo $((TODO + OVERDUE))`,
+});
+
 // ═══════════════════════════════════════════════════════════════
-// STREAM-ЗАПРОСЫ (ВОЗВРАЩАЕМ РАБОЧИЙ ПОДХОД ИЗ СТАРОГО СКРИПТА)
+// STREAM-ЗАПРОСЫ
 // ═══════════════════════════════════════════════════════════════
 
 // ТЕМПЕРАТУРА: 15с — поиск hwmon по имени
@@ -301,7 +315,7 @@ const targetNet = `while true; do
     /rx bitrate/ {rxr=$3}
     END {print s, f, si, txr, rxr, rx, tx}
   '
-  sleep 15
+  sleep 2
 done`;
 
 // CPU: 15с
@@ -375,10 +389,6 @@ const targetBattaryHeadsetEnergy = `while true; do
   sleep 120
 done`;
 
-// ═══════════════════════════════════════════════════════════════
-// ВОЗВРАЩАЕМ РАБОЧИЕ СКРИПТЫ ИЗ СТАРОЙ ВЕРСИИ
-// ═══════════════════════════════════════════════════════════════
-
 // СТАТУС БАТАРЕИ / ПИТАНИЯ (как в старом скрипте)
 const targetBattaryStatus = `while true; do
   AC_ONLINE=$(cat /sys/class/power_supply/AC/online 2>/dev/null || cat /sys/class/power_supply/ACAD/online 2>/dev/null)
@@ -427,7 +437,7 @@ awk -v v="$v" -v c="$c" 'BEGIN {
 }'`;
 
 // ═══════════════════════════════════════════════════════════════
-// ОБРАБОТЧИК ОТВЕТОВ (ВОЗВРАЩАЕМ СТАРУЮ ЛОГИКУ)
+// ОБРАБОТЧИК ОТВЕТОВ
 // ═══════════════════════════════════════════════════════════════
 
 window.onRunicResponse = function (response) {
@@ -474,7 +484,7 @@ window.onRunicResponse = function (response) {
       return;
     }
 
-    // === STREAM: обработка потоков (как в старом скрипте) ===
+    // === STREAM: обработка потоков ===
     if (response.action === "stream") {
       if (response.message.includes(targetNet))
         updateNetData(...response.data.split(";"));

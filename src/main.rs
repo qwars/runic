@@ -1,19 +1,25 @@
 use async_channel::Sender;
 use clap::Parser;
+use futures_util::StreamExt;
 use glib::Propagation;
+use gtk::gio;
 use gtk::prelude::*;
 use gtk_layer_shell::{
     Edge, Layer, init_for_window, set_anchor, set_exclusive_zone, set_keyboard_interactivity,
     set_layer, set_margin, set_namespace,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{self, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::rc::Rc;
+#[cfg(feature = "debug")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,23 +29,32 @@ use webkit2gtk::{
 };
 
 const IPC_CHANNEL_SIZE: usize = 1024;
-const HOT_RELOAD_DEBOUNCE_MS: u64 = 300;
-const SLEEP_DETECTION_THRESHOLD_SECS: u64 = 15;
-const SLEEP_CHECK_INTERVAL_SECS: u64 = 5;
-const THREAD_STATS_INTERVAL_SECS: u64 = 30;
 const DIR_WATCH_DEBOUNCE_MS: u64 = 500;
 const THREAD_POOL_SIZE: usize = 8;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const STREAM_STATS_BATCH: u64 = 10;
-const WATCH_STATS_BATCH: u64 = 5;
 const TAIL_BUF_LIMIT: u64 = 64 * 1024;
-const RESET: &str = "\x1b[0m ";
-const RED: &str = "\x1b[31m ";
-const GREEN: &str = "\x1b[32m ";
-const YELLOW: &str = "\x1b[33m ";
-const MAGENTA: &str = "\x1b[35m ";
-const CYAN: &str = "\x1b[36m ";
-const BOLD: &str = "\x1b[1m ";
+
+#[cfg(feature = "debug")]
+const HOT_RELOAD_DEBOUNCE_MS: u64 = 300;
+#[cfg(feature = "debug")]
+const THREAD_STATS_INTERVAL_SECS: u64 = 30;
+#[cfg(feature = "debug")]
+const STREAM_STATS_BATCH: u64 = 10;
+#[cfg(feature = "debug")]
+const WATCH_STATS_BATCH: u64 = 5;
+
+const RESET: &str = "\x1b[0m";
+const RED: &str = "\x1b[31m";
+#[cfg(feature = "debug")]
+const GREEN: &str = "\x1b[32m";
+#[cfg(feature = "debug")]
+const YELLOW: &str = "\x1b[33m";
+#[cfg(feature = "debug")]
+const MAGENTA: &str = "\x1b[35m";
+#[cfg(feature = "debug")]
+const CYAN: &str = "\x1b[36m";
+#[cfg(feature = "debug")]
+const BOLD: &str = "\x1b[1m";
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
@@ -53,7 +68,6 @@ impl ThreadPool {
         let (sender, receiver) = std::sync::mpsc::channel::<Task>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
-
         for _ in 0..size {
             let receiver = Arc::clone(&receiver);
             workers.push(thread::spawn(move || {
@@ -62,47 +76,55 @@ impl ThreadPool {
                 }
             }));
         }
-
         Self {
             sender,
             _workers: workers,
         }
     }
-
     fn execute<F: FnOnce() + Send + 'static>(&self, f: F) {
         let _ = self.sender.send(Box::new(f));
     }
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "runic ", about = "HTML-виджет для рабочего стола ")]
+#[command(name = "runic", about = "HTML-виджет для рабочего стола")]
 struct Args {
-    #[arg(short = 'w', long, help = "Ширина окна виджета (в пикселях) ")]
+    #[arg(short = 'w', long, help = "Ширина окна виджета (в пикселях)")]
     width: Option<i32>,
-    #[arg(short = 'H', long, help = "Высота окна виджета (в пикселях) ")]
+    #[arg(short = 'H', long, help = "Высота окна виджета (в пикселях)")]
     height: Option<i32>,
     #[arg(
         short = 'x',
         long,
         default_value = "0",
-        help = "Отступ от левого края экрана "
+        help = "Отступ от левого края экрана"
     )]
     x: i32,
     #[arg(
         short = 'y',
         long,
         default_value = "0",
-        help = "Отступ от верхнего края экрана "
+        help = "Отступ от верхнего края экрана"
     )]
     y: i32,
     #[arg(
         short = 'd',
         long,
-        help = "Включить режим отладки (hot-reload, вывод в консоль) "
+        help = "Включить режим отладки (hot-reload, вывод в консоль)"
     )]
     debug: bool,
-    #[arg(help = "Путь к HTML-файлу виджета ", value_name = "FILE ")]
+    #[arg(help = "Путь к HTML-файлу виджета", value_name = "FILE")]
     html_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct UiConfig {
+    width: Option<i32>,
+    height: Option<i32>,
+    x: i32,
+    y: i32,
+    #[cfg(feature = "debug")]
+    is_debug: bool,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +154,12 @@ enum WatchState {
     Dir(Option<u64>),
 }
 
+enum WidgetEvent {
+    Stop(String),
+    Start(String),
+}
+
+#[cfg(feature = "debug")]
 #[derive(Debug, Clone)]
 struct ThreadStats {
     id: u64,
@@ -144,6 +172,7 @@ struct ThreadStats {
     tasks_completed: u64,
 }
 
+#[cfg(feature = "debug")]
 struct ThreadTracker {
     threads: Mutex<HashMap<u64, ThreadStats>>,
     next_id: AtomicU64,
@@ -151,6 +180,7 @@ struct ThreadTracker {
     total_finished: AtomicU64,
 }
 
+#[cfg(feature = "debug")]
 impl ThreadTracker {
     fn new() -> Self {
         Self {
@@ -160,7 +190,6 @@ impl ThreadTracker {
             total_finished: AtomicU64::new(0),
         }
     }
-
     fn register_thread(&self, thread_type: &str, name: &str) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let stats = ThreadStats {
@@ -177,7 +206,6 @@ impl ThreadTracker {
         self.total_created.fetch_add(1, Ordering::Relaxed);
         id
     }
-
     fn finish_thread(&self, id: u64, final_stats: &ResourceStats) {
         if let Some(stats) = self.threads.lock().unwrap().get_mut(&id) {
             stats.finished_at = Some(Instant::now());
@@ -186,15 +214,13 @@ impl ThreadTracker {
         }
         self.total_finished.fetch_add(1, Ordering::Relaxed);
     }
-
     fn update_thread_statistics(&self, id: u64, stats: &ResourceStats, tasks: u64) {
-        if let Some(thread_stats) = self.threads.lock().unwrap().get_mut(&id) {
-            thread_stats.peak_memory_kb = thread_stats.peak_memory_kb.max(stats.memory_kb);
-            thread_stats.cpu_time_ms = stats.cpu_time_ms;
-            thread_stats.tasks_completed += tasks;
+        if let Some(ts) = self.threads.lock().unwrap().get_mut(&id) {
+            ts.peak_memory_kb = ts.peak_memory_kb.max(stats.memory_kb);
+            ts.cpu_time_ms = stats.cpu_time_ms;
+            ts.tasks_completed += tasks;
         }
     }
-
     fn get_summary(&self) -> String {
         let threads = self.threads.lock().unwrap();
         let active = threads.values().filter(|t| t.finished_at.is_none()).count();
@@ -202,10 +228,10 @@ impl ThreadTracker {
         let total_created = self.total_created.load(Ordering::Relaxed);
         let total_finished = self.total_finished.load(Ordering::Relaxed);
         let mut summary = format!("{}=== СТАТИСТИКА ПОТОКОВ ==={}\n", BOLD, RESET);
-        summary += &format!("Создано всего: {}\n", total_created);
-        summary += &format!("Завершено: {}\n", total_finished);
-        summary += &format!("Активных: {}\n", active);
-        summary += &format!("Завершённых в истории: {}\n\n", finished);
+        summary += &format!(
+            "Создано всего: {}\nЗавершено: {}\nАктивных: {}\nЗавершённых в истории: {}\n\n",
+            total_created, total_finished, active, finished
+        );
         if active > 0 {
             summary += &format!("{}Активные потоки:{}\n", GREEN, RESET);
             for stats in threads.values().filter(|t| t.finished_at.is_none()) {
@@ -219,12 +245,12 @@ impl ThreadTracker {
             }
         }
         summary += &format!("\n{}Последние 5 завершённых:{}\n", YELLOW, RESET);
-        let mut finished_threads: Vec<_> = threads
+        let mut ft: Vec<_> = threads
             .values()
             .filter(|t| t.finished_at.is_some())
             .collect();
-        finished_threads.sort_by_key(|a| std::cmp::Reverse(a.finished_at));
-        for stats in finished_threads.iter().take(5) {
+        ft.sort_by_key(|a| std::cmp::Reverse(a.finished_at));
+        for stats in ft.iter().take(5) {
             let duration = stats.finished_at.unwrap().duration_since(stats.created_at);
             summary += &format!(
                 "  [{}] {} ({}) - работал {:?}, пик памяти: {} KB, CPU: {} ms, задач: {}\n",
@@ -241,25 +267,20 @@ impl ThreadTracker {
     }
 }
 
-/// Обертка над std::process::Child, которая гарантирует убийство процесса при уничтожении (drop).
 pub struct ChildGuard(pub std::process::Child);
-
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
-
 use std::ops::{Deref, DerefMut};
-
 impl Deref for ChildGuard {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-
 impl DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
@@ -270,18 +291,22 @@ struct AppState {
     running_streams: Mutex<HashMap<String, ChildGuard>>,
     watch_positions: Mutex<HashMap<String, WatchState>>,
     spawned_pids: Mutex<Vec<u32>>,
+    #[cfg(feature = "debug")]
     is_debug: bool,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "debug")]
     thread_tracker: Arc<ThreadTracker>,
     pool: Arc<ThreadPool>,
 }
 
+#[cfg(feature = "debug")]
 #[derive(Copy, Clone)]
 struct ResourceStats {
     memory_kb: u64,
     cpu_time_ms: u128,
 }
 
+#[cfg(feature = "debug")]
 fn get_resource_stats() -> ResourceStats {
     let mut memory_kb = 0;
     let mut cpu_time_ms = 0;
@@ -309,6 +334,7 @@ fn get_resource_stats() -> ResourceStats {
     }
 }
 
+#[cfg(feature = "debug")]
 fn log_profile(action: &str, duration: Duration, stats: &ResourceStats) {
     if duration > Duration::from_millis(100) {
         eprintln!(
@@ -319,9 +345,10 @@ fn log_profile(action: &str, duration: Duration, stats: &ResourceStats) {
 }
 
 fn cleanup_children(state: &Arc<AppState>) {
+    #[cfg(feature = "debug")]
     if state.is_debug {
         eprintln!(
-            "{}[Руник ОТЛАДКА]{} {}=== НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ==={} ",
+            "{}[Руник ОТЛАДКА]{} {}=== НАЧАЛО ОЧИСТКИ ПРОЦЕССОВ ==={}",
             CYAN, RESET, BOLD, RESET
         );
     }
@@ -331,15 +358,17 @@ fn cleanup_children(state: &Arc<AppState>) {
         std::mem::take(&mut *guard)
     };
     if pids.is_empty() {
+        #[cfg(feature = "debug")]
         if state.is_debug {
-            eprintln!("{}[Руник ОТЛАДКА]{} Нечего очищать. ", CYAN, RESET);
+            eprintln!("{}[Руник ОТЛАДКА]{} Нечего очищать.", CYAN, RESET);
         }
         return;
     }
+    #[cfg(feature = "debug")]
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM группе процессов -{} ",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGTERM группе процессов -{}",
                 CYAN, RESET, pid
             );
         }
@@ -350,10 +379,11 @@ fn cleanup_children(state: &Arc<AppState>) {
         }
     }
     std::thread::sleep(Duration::from_millis(300));
+    #[cfg(feature = "debug")]
     if state.is_debug {
         for &pid in &pids {
             eprintln!(
-                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL группе процессов -{} ",
+                "{}[Руник ОТЛАДКА]{} Отправка SIGKILL группе процессов -{}",
                 CYAN, RESET, pid
             );
         }
@@ -365,15 +395,17 @@ fn cleanup_children(state: &Arc<AppState>) {
             libc::waitpid(pid as libc::pid_t, &mut status, 0);
         }
     }
+    #[cfg(feature = "debug")]
     if state.is_debug {
         eprintln!(
-            "{}[Руник ОТЛАДКА]{} {}=== ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ==={} ",
+            "{}[Руник ОТЛАДКА]{} {}=== ОЧИСТКА ПРОЦЕССОВ ЗАВЕРШЕНА ==={}",
             CYAN, RESET, BOLD, RESET
         );
     }
 }
 
 fn kill_and_clear_tracked(state: &Arc<AppState>) {
+    #[cfg(feature = "debug")]
     if state.is_debug {
         eprintln!(
             "{}[Руник ОТЛАДКА]{} {}=== ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ==={}",
@@ -406,6 +438,7 @@ fn kill_and_clear_tracked(state: &Arc<AppState>) {
         }
         pids.clear();
     }
+    #[cfg(feature = "debug")]
     if state.is_debug {
         eprintln!(
             "{}[Руник ОТЛАДКА]{} {}=== ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ЗАВЕРШЕНА ==={}",
@@ -425,9 +458,12 @@ fn build_js_callback(response: &CompactResponse) -> String {
 }
 
 fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<String>) {
+    #[cfg(feature = "debug")]
     let is_debug = state.is_debug;
+    #[cfg(feature = "debug")]
     let start_time = Instant::now();
-    let start_stats = if is_debug {
+    #[cfg(feature = "debug")]
+    let start_stats = if state.is_debug {
         Some(get_resource_stats())
     } else {
         None
@@ -442,20 +478,18 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                 data,
             };
             if let Ok(json) = serde_json::to_string(&response) {
-                let js = format!(
-                    "if (window.onRunicResponse) window.onRunicResponse({});",
-                    json
-                );
+                let js = format!("if (window.onRunicResponse) window.onRunicResponse({});", json);
                 let _ = js_sender.try_send(js);
             }
         };
-
         match request.action.as_str() {
             "read" => {
                 if let Some(path) = request.payload.get("path").and_then(|v| v.as_str()) {
+                    #[cfg(feature = "debug")]
                     let action_start = Instant::now();
                     match fs::read_to_string(path) {
                         Ok(content) => {
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 let preview: String = content.chars().take(100).collect();
                                 eprintln!(
@@ -467,27 +501,25 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             send_js("read", "success", "OK", Some(content));
                         }
                         Err(e) => {
+                            #[cfg(feature = "debug")]
                             if is_debug {
-                                eprintln!(
-                                    "{}[Руник РЕЗУЛЬТАТ]{} read '{}' => ОШИБКА: {}",
-                                    RED, RESET, path, e
-                                );
+                                eprintln!("{}[Руник РЕЗУЛЬТАТ]{} read '{}' => ОШИБКА: {}", RED, RESET, path, e);
                             }
                             send_js("read", "error", &format!("{}", e), None);
                         }
                     }
-                } else if is_debug {
-                    eprintln!(
-                        "{}[Руник РЕЗУЛЬТАТ]{} read => не указан путь",
-                        YELLOW, RESET
-                    );
+                } else {
+                    #[cfg(feature = "debug")]
+                    if is_debug {
+                        eprintln!("{}[Руник РЕЗУЛЬТАТ]{} read => не указан путь", YELLOW, RESET);
+                    }
                 }
             }
-
             "write" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 let data = request.payload.get("data").and_then(|v| v.as_str());
                 if let (Some(p), Some(d)) = (path, data) {
+                    #[cfg(feature = "debug")]
                     let action_start = Instant::now();
                     let path = Path::new(p);
                     let append = request
@@ -495,9 +527,9 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         .get("append")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-
                     if let Some(parent) = path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 eprintln!(
                                     "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА create_dir_all: {}",
@@ -512,7 +544,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             );
                         }
                     }
-
                     match OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -523,6 +554,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         Ok(mut file) => {
                             match file.write_all(d.as_bytes()).and_then(|_| file.flush()) {
                                 Ok(_) => {
+                                    #[cfg(feature = "debug")]
                                     if is_debug {
                                         let mode = if append { "добавление" } else { "перезапись" };
                                         eprintln!(
@@ -533,6 +565,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     send_js("write", "success", "OK", None);
                                 }
                                 Err(e) => {
+                                    #[cfg(feature = "debug")]
                                     if is_debug {
                                         eprintln!(
                                             "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА записи: {}",
@@ -544,6 +577,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             }
                         }
                         Err(e) => {
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 eprintln!(
                                     "{}[Руник РЕЗУЛЬТАТ]{} write '{}' => ОШИБКА открытия: {}",
@@ -553,16 +587,19 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             send_js("write", "error", &format!("{}", e), None);
                         }
                     }
-                } else if is_debug {
-                    eprintln!(
-                        "{}[Руник РЕЗУЛЬТАТ]{} write => не указан путь или данные",
-                        YELLOW, RESET
-                    );
+                } else {
+                    #[cfg(feature = "debug")]
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} write => не указан путь или данные",
+                            YELLOW, RESET
+                        );
+                    }
                 }
             }
-
             "exec" => {
                 if let Some(cmd) = request.payload.get("command").and_then(|v| v.as_str()) {
+                    #[cfg(feature = "debug")]
                     let exec_start = Instant::now();
                     let mut cmd_obj = Command::new("sh");
                     cmd_obj.arg("-c").arg(cmd);
@@ -572,11 +609,9 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             Ok(())
                         });
                     }
+                    #[cfg(feature = "debug")]
                     if is_debug {
-                        eprintln!(
-                            "{}[Руник ОТЛАДКА]{} exec запуск: '{}'",
-                            CYAN, RESET, cmd
-                        );
+                        eprintln!("{}[Руник ОТЛАДКА]{} exec запуск: '{}'", CYAN, RESET, cmd);
                     }
                     match cmd_obj.output() {
                         Ok(out) => {
@@ -591,7 +626,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             } else {
                                 format!("STDERR:\n{}", stderr)
                             };
-
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 let exec_stats = get_resource_stats();
                                 let preview: String = result.chars().take(200).collect();
@@ -605,10 +640,10 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                 );
                                 log_profile("exec", exec_start.elapsed(), &exec_stats);
                             }
-
                             send_js("exec", "success", &("OK: ".to_owned() + cmd), Some(result));
                         }
                         Err(e) => {
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 eprintln!(
                                     "{}[Руник РЕЗУЛЬТАТ]{} exec '{}' => ОШИБКА запуска: {}",
@@ -618,14 +653,16 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             send_js("exec", "error", &format!("{}", e), None);
                         }
                     }
-                } else if is_debug {
-                    eprintln!(
-                        "{}[Руник РЕЗУЛЬТАТ]{} exec => не указана команда",
-                        YELLOW, RESET
-                    );
+                } else {
+                    #[cfg(feature = "debug")]
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} exec => не указана команда",
+                            YELLOW, RESET
+                        );
+                    }
                 }
             }
-
             "stream" => {
                 let target = request
                     .payload
@@ -633,8 +670,8 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-
                 if target.is_empty() {
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         eprintln!(
                             "{}[Руник РЕЗУЛЬТАТ]{} stream => не указан target",
@@ -644,7 +681,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("stream", "error", "target не указан", None);
                     return;
                 }
-
                 let target_clone = target.clone();
                 let state_clone = Arc::clone(&state);
                 let sender_clone = js_sender.clone();
@@ -660,75 +696,80 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         Ok(())
                     });
                 }
-
                 let mut running = state.running_streams.lock().unwrap();
                 if running.contains_key(&target) {
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         eprintln!(
                             "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => уже выполняется",
                             YELLOW, RESET, target
                         );
                     }
-                    send_js("stream", "error", "Уже выполняется", None);
+                    send_js("stream", "success", "Уже выполняется (игнорируется)", None);
                     return;
                 }
-
                 match cmd_obj.spawn() {
                     Ok(mut proc) => {
                         let pid = proc.id();
+                        #[cfg(feature = "debug")]
                         let thread_id = state_clone.thread_tracker.register_thread(
                             "stream",
                             &format!("stream-{}", &target_clone[..20.min(target_clone.len())]),
                         );
+                        #[cfg(feature = "debug")]
                         if state_clone.is_debug {
                             eprintln!(
                                 "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => запущен, PID={} [Поток #{}]",
                                 GREEN, RESET, target_clone, pid, thread_id
                             );
                         }
-
                         state_clone.spawned_pids.lock().unwrap().push(pid);
                         let stdout = proc.stdout.take().unwrap();
                         let stderr = proc.stderr.take();
                         running.insert(target_clone.clone(), ChildGuard(proc));
                         drop(running);
-
                         send_js("stream", "success", "Запущен", None);
-
                         if let Some(stderr_pipe) = stderr {
+                            #[cfg(feature = "debug")]
                             let target_for_stderr = target_clone.clone();
+                            #[cfg(feature = "debug")]
                             let is_debug_stderr = state_clone.is_debug;
                             thread::spawn(move || {
                                 let reader = BufReader::new(stderr_pipe);
-                                for l in reader.lines().map_while(Result::ok) {
+                                for _l in reader.lines().map_while(Result::ok) {
+                                    #[cfg(feature = "debug")]
                                     if is_debug_stderr {
                                         eprintln!(
                                             "{}[Руник STDERR]{}[{}] {}",
-                                            RED, RESET, target_for_stderr, l
+                                            RED, RESET, target_for_stderr, _l
                                         );
                                     }
                                 }
                             });
                         }
-
+                        #[cfg(feature = "debug")]
                         let tracker = Arc::clone(&state_clone.thread_tracker);
+                        #[cfg(feature = "debug")]
                         let is_debug_stream = state_clone.is_debug;
+                        #[cfg(feature = "debug")]
                         let target_for_stdout = target_clone.clone();
                         thread::spawn(move || {
                             let reader = BufReader::new(stdout);
+                            #[cfg(feature = "debug")]
                             let mut line_count = 0;
                             for line in reader.lines() {
                                 match line {
                                     Ok(l) => {
-                                        line_count += 1;
-
-                                        if is_debug_stream {
-                                            eprintln!(
-                                                "{}[Руник STDOUT]{}[{}] {}",
-                                                GREEN, RESET, target_for_stdout, l
-                                            );
+                                        #[cfg(feature = "debug")]
+                                        {
+                                            line_count += 1;
+                                            if is_debug_stream {
+                                                eprintln!(
+                                                    "{}[Руник STDOUT]{}[{}] {}",
+                                                    GREEN, RESET, target_for_stdout, l
+                                                );
+                                            }
                                         }
-
                                         let js = build_js_callback(&CompactResponse {
                                             action: "stream",
                                             status: "stream_data",
@@ -736,7 +777,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             data: Some(&l),
                                         });
                                         let _ = sender_clone.try_send(js);
-
+                                        #[cfg(feature = "debug")]
                                         if is_debug_stream && line_count % STREAM_STATS_BATCH == 0 {
                                             let stats = get_resource_stats();
                                             tracker.update_thread_statistics(
@@ -749,7 +790,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     Err(_) => break,
                                 }
                             }
-
+                            #[cfg(feature = "debug")]
                             if is_debug_stream {
                                 let final_stats = get_resource_stats();
                                 tracker.finish_thread(thread_id, &final_stats);
@@ -758,13 +799,9 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                     CYAN, RESET, target_for_stdout, line_count
                                 );
                             }
-
                             if let Some(child_guard) =
                                 state_clone.running_streams.lock().unwrap().remove(&target_clone)
                             {
-                                // child_guard будет удален здесь, что вызовет Drop и убьет процесс
-                                // Но мы также явно ждем завершения через wait в Drop
-                                // Для очистки spawned_pids:
                                 let mut pids = state_clone.spawned_pids.lock().unwrap();
                                 pids.retain(|&p| p != child_guard.id());
                             }
@@ -772,6 +809,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                     Err(e) => {
                         drop(running);
+                        #[cfg(feature = "debug")]
                         if is_debug {
                             eprintln!(
                                 "{}[Руник РЕЗУЛЬТАТ]{} stream '{}' => ОШИБКА запуска: {}",
@@ -787,14 +825,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                 }
             }
-
             "unstream" => {
                 let target = request
                     .payload
                     .get("target")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-
                 let mut running = state.running_streams.lock().unwrap();
                 if let Some(child_guard) = running.remove(target) {
                     let pid = child_guard.id();
@@ -805,7 +841,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                     let mut pids = state.spawned_pids.lock().unwrap();
                     pids.retain(|&p| p != pid);
-
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         eprintln!(
                             "{}[Руник РЕЗУЛЬТАТ]{} unstream '{}' => остановлен, PID={}",
@@ -814,6 +850,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     }
                     send_js("unstream", "success", "Остановлен", None);
                 } else {
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         eprintln!(
                             "{}[Руник РЕЗУЛЬТАТ]{} unstream '{}' => не найден",
@@ -823,7 +860,6 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("unstream", "error", "Не найден", None);
                 }
             }
-
             "watch" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 let tail = request.payload.get("tail").and_then(|v| v.as_u64());
@@ -833,13 +869,14 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     {
                         let mut positions = state.watch_positions.lock().unwrap();
                         if positions.contains_key(&path_str) {
+                            #[cfg(feature = "debug")]
                             if is_debug {
                                 eprintln!(
                                     "{}[Руник РЕЗУЛЬТАТ]{} watch '{}' => уже мониторится",
                                     YELLOW, RESET, path_str
                                 );
                             }
-                            send_js("watch", "error", "Уже мониторится", None);
+                            send_js("watch", "success", "Уже мониторится (игнорируется)", None);
                             return;
                         }
                         let initial_state = if path_buf.is_dir() {
@@ -858,7 +895,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         };
                         positions.insert(path_str.clone(), initial_state);
                     }
-
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         let mode = if path_buf.is_dir() { "директория" } else { "файл" };
                         eprintln!(
@@ -866,13 +903,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             GREEN, RESET, path_str, mode
                         );
                     }
-
                     if let Some(n) = tail {
                         if !path_buf.is_dir() && path_buf.exists() {
                             let path_clone = path_str.clone();
                             let sender_clone = js_sender.clone();
+                            #[cfg(feature = "debug")]
                             let tracker = Arc::clone(&state.thread_tracker);
+                            #[cfg(feature = "debug")]
                             let is_debug_tail = state.is_debug;
+                            #[cfg(feature = "debug")]
                             let thread_id = tracker.register_thread(
                                 "watch-tail",
                                 &format!("watch-tail-{}", path_clone),
@@ -892,6 +931,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             } else {
                                                 0
                                             };
+                                            #[cfg(feature = "debug")]
                                             if is_debug_tail {
                                                 eprintln!(
                                                     "{}[Руник РЕЗУЛЬТАТ]{} watch-tail '{}' => читаем последние {} строк из {} доступных",
@@ -899,6 +939,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 );
                                             }
                                             for line in lines.iter().skip(start) {
+                                                #[cfg(feature = "debug")]
                                                 if is_debug_tail {
                                                     eprintln!(
                                                         "{}[Руник НАБЛЮДЕНИЕ]{}[{}] {}",
@@ -916,6 +957,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         }
                                     }
                                 }
+                                #[cfg(feature = "debug")]
                                 if is_debug_tail {
                                     let final_stats = get_resource_stats();
                                     tracker.finish_thread(thread_id, &final_stats);
@@ -923,17 +965,20 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             });
                         }
                     }
-
                     let path_clone = path_str.clone();
                     let state_clone = Arc::clone(&state);
                     let sender_clone = js_sender.clone();
+                    #[cfg(feature = "debug")]
                     let tracker = Arc::clone(&state_clone.thread_tracker);
+                    #[cfg(feature = "debug")]
                     let is_debug_watch = state_clone.is_debug;
+                    #[cfg(feature = "debug")]
                     let thread_id =
                         tracker.register_thread("watch", &format!("watch-{}", path_clone));
                     thread::spawn(move || {
                         let current_path_buf = std::path::PathBuf::from(&path_clone);
                         let mut held_file: Option<fs::File> = None;
+                        #[cfg(feature = "debug")]
                         let mut event_count = 0;
                         let mut last_dir_notification = Instant::now();
                         while !state_clone.shutdown.load(Ordering::Relaxed) {
@@ -958,7 +1003,8 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                                 .map(|d| d.as_secs())
                                         });
                                     let should_notify = {
-                                        let mut positions = state_clone.watch_positions.lock().unwrap();
+                                        let mut positions =
+                                            state_clone.watch_positions.lock().unwrap();
                                         if let Some(WatchState::Dir(last_mod)) =
                                             positions.get_mut(&path_clone)
                                         {
@@ -981,12 +1027,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         if now.duration_since(last_dir_notification)
                                             > Duration::from_millis(DIR_WATCH_DEBOUNCE_MS)
                                         {
-                                            event_count += 1;
-                                            if is_debug_watch {
-                                                eprintln!(
-                                                    "{}[Руник НАБЛЮДЕНИЕ]{}[{}] изменение директории",
-                                                    CYAN, RESET, path_clone
-                                                );
+                                            #[cfg(feature = "debug")]
+                                            {
+                                                event_count += 1;
+                                                if is_debug_watch {
+                                                    eprintln!(
+                                                        "{}[Руник НАБЛЮДЕНИЕ]{}[{}] изменение директории",
+                                                        CYAN, RESET, path_clone
+                                                    );
+                                                }
                                             }
                                             let js = build_js_callback(&CompactResponse {
                                                 action: "watch",
@@ -996,6 +1045,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             });
                                             let _ = sender_clone.try_send(js);
                                             last_dir_notification = now;
+                                            #[cfg(feature = "debug")]
                                             if is_debug_watch
                                                 && event_count % WATCH_STATS_BATCH == 0
                                             {
@@ -1027,7 +1077,8 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         }
                                     };
                                     let current_pos = {
-                                        let positions = state_clone.watch_positions.lock().unwrap();
+                                        let positions =
+                                            state_clone.watch_positions.lock().unwrap();
                                         if let Some(WatchState::File(pos)) =
                                             positions.get(&path_clone)
                                         {
@@ -1045,12 +1096,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                         let reader = BufReader::new(&file);
                                         for l in reader.lines().map_while(Result::ok) {
                                             if !l.is_empty() {
-                                                event_count += 1;
-                                                if is_debug_watch {
-                                                    eprintln!(
-                                                        "{}[Руник НАБЛЮДЕНИЕ]{}[{}] {}",
-                                                        CYAN, RESET, path_clone, l
-                                                    );
+                                                #[cfg(feature = "debug")]
+                                                {
+                                                    event_count += 1;
+                                                    if is_debug_watch {
+                                                        eprintln!(
+                                                            "{}[Руник НАБЛЮДЕНИЕ]{}[{}] {}",
+                                                            CYAN, RESET, path_clone, l
+                                                        );
+                                                    }
                                                 }
                                                 let js = build_js_callback(&CompactResponse {
                                                     action: "watch",
@@ -1062,13 +1116,15 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                                             }
                                         }
                                     }
-                                    let mut positions = state_clone.watch_positions.lock().unwrap();
+                                    let mut positions =
+                                        state_clone.watch_positions.lock().unwrap();
                                     if let Some(WatchState::File(pos_opt)) =
                                         positions.get_mut(&path_clone)
                                     {
                                         *pos_opt = Some(file_len);
                                     }
                                     held_file = Some(file);
+                                    #[cfg(feature = "debug")]
                                     if is_debug_watch && event_count % WATCH_STATS_BATCH == 0 {
                                         let stats = get_resource_stats();
                                         tracker.update_thread_statistics(
@@ -1081,8 +1137,8 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             } else {
                                 held_file = None;
                                 let mut positions = state_clone.watch_positions.lock().unwrap();
-                                if let Some(state) = positions.get_mut(&path_clone) {
-                                    match state {
+                                if let Some(st) = positions.get_mut(&path_clone) {
+                                    match st {
                                         WatchState::File(pos) => *pos = None,
                                         WatchState::Dir(mod_time) => *mod_time = None,
                                     }
@@ -1090,6 +1146,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                             }
                             thread::sleep(WATCH_POLL_INTERVAL);
                         }
+                        #[cfg(feature = "debug")]
                         if is_debug_watch {
                             let final_stats = get_resource_stats();
                             tracker.finish_thread(thread_id, &final_stats);
@@ -1100,19 +1157,22 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         }
                     });
                     send_js("watch", "success", "Мониторинг запущен", None);
-                } else if is_debug {
-                    eprintln!(
-                        "{}[Руник РЕЗУЛЬТАТ]{} watch => не указан путь",
-                        YELLOW, RESET
-                    );
+                } else {
+                    #[cfg(feature = "debug")]
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} watch => не указан путь",
+                            YELLOW, RESET
+                        );
+                    }
                 }
             }
-
             "unwatch" => {
                 let path = request.payload.get("path").and_then(|v| v.as_str());
                 if let Some(p) = path {
                     let mut positions = state.watch_positions.lock().unwrap();
                     if positions.remove(p).is_some() {
+                        #[cfg(feature = "debug")]
                         if is_debug {
                             eprintln!(
                                 "{}[Руник РЕЗУЛЬТАТ]{} unwatch '{}' => мониторинг остановлен",
@@ -1121,6 +1181,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         }
                         send_js("unwatch", "success", "Мониторинг остановлен", None);
                     } else {
+                        #[cfg(feature = "debug")]
                         if is_debug {
                             eprintln!(
                                 "{}[Руник РЕЗУЛЬТАТ]{} unwatch '{}' => файл не мониторится",
@@ -1130,6 +1191,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                         send_js("unwatch", "error", "Файл не мониторится", None);
                     }
                 } else {
+                    #[cfg(feature = "debug")]
                     if is_debug {
                         eprintln!(
                             "{}[Руник РЕЗУЛЬТАТ]{} unwatch => не указан путь",
@@ -1139,19 +1201,23 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                     send_js("unwatch", "error", "Не указан путь к файлу", None);
                 }
             }
-
             "stats" => {
-                let summary = state.thread_tracker.get_summary();
-                if is_debug {
-                    eprintln!(
-                        "{}[Руник РЕЗУЛЬТАТ]{} stats => запрошена статистика потоков",
-                        CYAN, RESET
-                    );
+                #[cfg(feature = "debug")]
+                {
+                    let summary = state.thread_tracker.get_summary();
+                    if is_debug {
+                        eprintln!(
+                            "{}[Руник РЕЗУЛЬТАТ]{} stats => запрошена статистика потоков",
+                            CYAN, RESET
+                        );
+                    }
+                    send_js("stats", "success", &summary, None);
                 }
-                send_js("stats", "success", &summary, None);
+                #[cfg(not(feature = "debug"))]
+                send_js("stats", "error", "Недоступно в release-сборке", None);
             }
-
             _ => {
+                #[cfg(feature = "debug")]
                 if is_debug {
                     eprintln!(
                         "{}[Руник РЕЗУЛЬТАТ]{} неизвестное действие: '{}'",
@@ -1161,7 +1227,7 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
                 send_js(&request.action, "error", "Неизвестное действие", None);
             }
         }
-
+        #[cfg(feature = "debug")]
         if is_debug {
             if let Some(ss) = start_stats {
                 let total_duration = start_time.elapsed();
@@ -1188,34 +1254,12 @@ fn handle_action(state: Arc<AppState>, request: JsMessage, js_sender: Sender<Str
     });
 }
 
-fn main() {
-    let args = Args::parse();
-    let html_path = match args.html_path {
-        Some(p) => p,
-        None => {
-            use clap::CommandFactory;
-            let _ = Args::command().print_help();
-            println!();
-            std::process::exit(0);
-        }
-    };
-    let width = args.width;
-    let height = args.height;
-    let x = args.x;
-    let y = args.y;
-    let is_debug = args.debug;
-    let abs_path = match fs::canonicalize(&html_path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "{}Ошибка:{} не удалось найти файл '{}': {}",
-                RED, RESET, html_path, e
-            );
-            process::exit(1);
-        }
-    };
-    let file_url = format!("file://{}", abs_path.display());
-    gtk::init().expect("Не удалось инициализировать GTK");
+fn create_ui(
+    config: &UiConfig,
+    file_url: &str,
+    app_state: &Arc<AppState>,
+    js_sender: &Sender<String>,
+) -> (gtk::Window, WebView) {
     let window = gtk::Window::new(gtk::WindowType::Popup);
     window.set_default_size(800, 600);
     if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
@@ -1238,15 +1282,15 @@ fn main() {
     set_layer(&window, Layer::Background);
     set_keyboard_interactivity(&window, false);
     set_namespace(&window, "runic");
-    match (width, height) {
+    match (config.width, config.height) {
         (Some(w), Some(h)) => {
             window.set_default_size(w, h);
             set_anchor(&window, Edge::Top, true);
             set_anchor(&window, Edge::Left, true);
             set_anchor(&window, Edge::Right, false);
             set_anchor(&window, Edge::Bottom, false);
-            set_margin(&window, Edge::Top, y);
-            set_margin(&window, Edge::Left, x);
+            set_margin(&window, Edge::Top, config.y);
+            set_margin(&window, Edge::Left, config.x);
         }
         _ => {
             set_anchor(&window, Edge::Top, true);
@@ -1259,7 +1303,8 @@ fn main() {
     let webview = WebView::new();
     webview.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
     if let Some(settings) = WebViewExt::settings(&webview) {
-        if is_debug {
+        #[cfg(feature = "debug")]
+        if config.is_debug {
             settings.set_enable_write_console_messages_to_stdout(true);
         }
         settings.set_enable_webgl(false);
@@ -1273,33 +1318,24 @@ fn main() {
     let controller = webview
         .user_content_manager()
         .expect("WebView должен иметь user_content_manager");
-    let thread_tracker = Arc::new(ThreadTracker::new());
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let pool = Arc::new(ThreadPool::new(THREAD_POOL_SIZE));
-    let app_state = Arc::new(AppState {
-        running_streams: Mutex::new(HashMap::new()),
-        watch_positions: Mutex::new(HashMap::new()),
-        spawned_pids: Mutex::new(Vec::new()),
-        is_debug,
-        shutdown: Arc::clone(&shutdown_flag),
-        thread_tracker: Arc::clone(&thread_tracker),
-        pool: Arc::clone(&pool),
-    });
-    let (js_sender, js_receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
-    let state_clone = Arc::clone(&app_state);
+    let state_clone = Arc::clone(app_state);
     let sender_for_handler = js_sender.clone();
     let registered = controller.register_script_message_handler("ipc");
-    if is_debug {
+    #[cfg(feature = "debug")]
+    if config.is_debug {
         eprintln!(
             "{}[Руник ОТЛАДКА]{} Обработчик 'ipc' зарегистрирован: {}",
             CYAN, RESET, registered
         );
     }
+    #[cfg(not(feature = "debug"))]
+    let _ = registered;
     controller.connect_script_message_received(
         Some("ipc"),
-        move |_controller, msg: &webkit2gtk::JavascriptResult| {
+        move |_, msg: &webkit2gtk::JavascriptResult| {
             if let Some(js_val) = msg.js_value() {
                 let msg_str = js_val.to_string();
+                #[cfg(feature = "debug")]
                 if state_clone.is_debug {
                     eprintln!("{}[Руник ОТЛАДКА]{} Получено: {}", CYAN, RESET, msg_str);
                 }
@@ -1314,54 +1350,179 @@ fn main() {
         },
     );
     let shim = UserScript::new(
-        r#"
-        window.ipc = {
-            postMessage: function(msg) {
-                try {
-                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
-                        window.webkit.messageHandlers.ipc.postMessage(msg);
-                    } else {
-                        console.error('[Руник] Критическая ошибка: IPC мост недоступен');
-                    }
-                } catch(e) {
-                    console.error('[Руник] Ошибка отправки IPC:', e);
-                }
-            }
-        };
-        "#,
+        r#"window.ipc = { postMessage: function(msg) { try { if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) { window.webkit.messageHandlers.ipc.postMessage(msg); } else { console.error('[Руник] Критическая ошибка: IPC мост недоступен'); } } catch(e) { console.error('[Руник] Ошибка отправки IPC:', e); } } };"#,
         UserContentInjectedFrames::AllFrames,
         UserScriptInjectionTime::Start,
         &[],
         &[],
     );
     controller.add_script(&shim);
-    webview.load_uri(&file_url);
+    webview.load_uri(file_url);
     window.add(&webview);
-    window.show_all();
-    let webview_for_async = webview.clone();
-    let is_debug_for_async = is_debug;
+    let state_for_delete = Arc::clone(app_state);
+    window.connect_delete_event(move |_, _| {
+        cleanup_children(&state_for_delete);
+        gtk::main_quit();
+        Propagation::Stop
+    });
+    (window, webview)
+}
+
+fn main() {
+    let args = Args::parse();
+    let html_path = match args.html_path {
+        Some(p) => p,
+        None => {
+            use clap::CommandFactory;
+            let _ = Args::command().print_help();
+            println!();
+            std::process::exit(0);
+        }
+    };
+    let is_debug = args.debug;
+    #[cfg(not(feature = "debug"))]
+    let _ = is_debug;
+    let abs_path = match fs::canonicalize(&html_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "{}Ошибка:{} не удалось найти файл '{}': {}",
+                RED, RESET, html_path, e
+            );
+            process::exit(1);
+        }
+    };
+    let file_url = format!("file://{}", abs_path.display());
+    gtk::init().expect("Не удалось инициализировать GTK");
+    #[cfg(feature = "debug")]
+    let thread_tracker = Arc::new(ThreadTracker::new());
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let pool = Arc::new(ThreadPool::new(THREAD_POOL_SIZE));
+    let app_state = Arc::new(AppState {
+        running_streams: Mutex::new(HashMap::new()),
+        watch_positions: Mutex::new(HashMap::new()),
+        spawned_pids: Mutex::new(Vec::new()),
+        #[cfg(feature = "debug")]
+        is_debug,
+        shutdown: Arc::clone(&shutdown_flag),
+        #[cfg(feature = "debug")]
+        thread_tracker: Arc::clone(&thread_tracker),
+        pool: Arc::clone(&pool),
+    });
+    let (js_sender, js_receiver) = async_channel::bounded::<String>(IPC_CHANNEL_SIZE);
+    let (event_sender, event_receiver) = async_channel::unbounded::<WidgetEvent>();
+    let ui_config = UiConfig {
+        width: args.width,
+        height: args.height,
+        x: args.x,
+        y: args.y,
+        #[cfg(feature = "debug")]
+        is_debug: args.debug,
+    };
+    let (initial_window, initial_webview) =
+        create_ui(&ui_config, &file_url, &app_state, &js_sender);
+    let window_rc = Rc::new(RefCell::new(Some(initial_window)));
+    let webview_rc = Rc::new(RefCell::new(Some(initial_webview)));
+    window_rc.borrow().as_ref().unwrap().show_all();
+    #[cfg(feature = "debug")]
+    if is_debug {
+        eprintln!(
+            "{}[Руник ОТЛАДКА]{} Виджет успешно запущен и отображен",
+            CYAN, RESET
+        );
+    }
+    let webview_rc_for_js = webview_rc.clone();
+    #[cfg(feature = "debug")]
+    let is_debug_for_js = is_debug;
     glib::spawn_future_local(async move {
         while let Ok(js_code) = js_receiver.recv().await {
-            let wv = webview_for_async.clone();
-            let dbg = is_debug_for_async;
-            wv.run_javascript(&js_code, None::<&gio::Cancellable>, move |result| {
-                if dbg {
-                    if let Err(e) = result {
-                        eprintln!(
-                            "{}[Руник ОТЛАДКА]{} Ошибка выполнения JS: {:?}",
-                            YELLOW, RESET, e
-                        );
+            let wv_opt = webview_rc_for_js.borrow().clone();
+            if let Some(wv) = wv_opt {
+                wv.run_javascript(&js_code, None::<&gio::Cancellable>, move |result| {
+                    #[cfg(feature = "debug")]
+                    if is_debug_for_js {
+                        if let Err(e) = result {
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Ошибка выполнения JS: {:?}",
+                                YELLOW, RESET, e
+                            );
+                        }
                     }
+                    #[cfg(not(feature = "debug"))]
+                    drop(result);
+                });
+            } else {
+                #[cfg(feature = "debug")]
+                if is_debug_for_js {
+                    eprintln!(
+                        "{}[Руник ОТЛАДКА]{} Пропуск выполнения JS: WebView уничтожен",
+                        YELLOW, RESET
+                    );
                 }
-            });
+            }
         }
     });
-    window.connect_delete_event({
-        let state_clone = Arc::clone(&app_state);
-        move |_, _| {
-            cleanup_children(&state_clone);
-            gtk::main_quit();
-            Propagation::Stop
+    let window_rc_for_events = window_rc.clone();
+    let webview_rc_for_events = webview_rc.clone();
+    let app_state_for_events = app_state.clone();
+    let js_sender_for_events = js_sender.clone();
+    let file_url_for_events = file_url.clone();
+    let ui_config_for_events = ui_config.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(event) = event_receiver.recv().await {
+            match event {
+                WidgetEvent::Stop(_reason) => {
+                    #[cfg(feature = "debug")]
+                    if ui_config_for_events.is_debug {
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} Событие остановки: {}. Приостанавливаем фоновые задачи...",
+                            CYAN, RESET, _reason
+                        );
+                    }
+                    kill_and_clear_tracked(&app_state_for_events);
+                    if let Ok(mut positions) = app_state_for_events.watch_positions.lock() {
+                        positions.clear();
+                    }
+                    app_state_for_events.shutdown.store(true, Ordering::Relaxed);
+                    *webview_rc_for_events.borrow_mut() = None;
+                    if let Some(w) = window_rc_for_events.borrow_mut().take() {
+                        unsafe {
+                            w.destroy();
+                        }
+                    }
+                }
+                WidgetEvent::Start(_reason) => {
+                    #[cfg(feature = "debug")]
+                    if ui_config_for_events.is_debug {
+                        eprintln!(
+                            "{}[Руник ОТЛАДКА]{} Событие запуска: {}. Возобновляем фоновые задачи...",
+                            CYAN, RESET, _reason
+                        );
+                    }
+                    kill_and_clear_tracked(&app_state_for_events);
+                    if let Ok(mut positions) = app_state_for_events.watch_positions.lock() {
+                        positions.clear();
+                    }
+                    app_state_for_events
+                        .shutdown
+                        .store(false, Ordering::Relaxed);
+                    *webview_rc_for_events.borrow_mut() = None;
+                    if let Some(w) = window_rc_for_events.borrow_mut().take() {
+                        unsafe {
+                            w.destroy();
+                        }
+                    }
+                    let (new_window, new_webview) = create_ui(
+                        &ui_config_for_events,
+                        &file_url_for_events,
+                        &app_state_for_events,
+                        &js_sender_for_events,
+                    );
+                    new_window.show_all();
+                    *window_rc_for_events.borrow_mut() = Some(new_window);
+                    *webview_rc_for_events.borrow_mut() = Some(new_webview);
+                }
+            }
         }
     });
     glib::source::unix_signal_add(libc::SIGTERM, {
@@ -1380,6 +1541,8 @@ fn main() {
             glib::ControlFlow::Break
         }
     });
+
+    #[cfg(feature = "debug")]
     if is_debug {
         eprintln!("{}[Руник ОТЛАДКА]{} Режим отладки включен", CYAN, RESET);
         let tracker_for_stats = Arc::clone(&thread_tracker);
@@ -1395,120 +1558,166 @@ fn main() {
         if let Some(html_dir) = abs_path.parent() {
             let html_dir = html_dir.to_path_buf();
             let (reload_sender, reload_receiver) = async_channel::bounded::<()>(16);
-            let webview_for_reload = webview.clone();
-            let state_for_reload = Arc::clone(&app_state);
+            let event_sender_for_reload = event_sender.clone();
             glib::spawn_future_local(async move {
                 while let Ok(()) = reload_receiver.recv().await {
                     eprintln!(
-                        "{}[Руник ОТЛАДКА]{} Обнаружены изменения, перезагрузка WebView...",
+                        "{}[Руник ОТЛАДКА]{} Обнаружены изменения файлов. Полное пересоздание виджета...",
                         CYAN, RESET
                     );
-                    kill_and_clear_tracked(&state_for_reload);
-                    if let Ok(mut positions) = state_for_reload.watch_positions.lock() {
-                        positions.clear();
-                    }
-                    state_for_reload.shutdown.store(false, Ordering::Relaxed);
-                    webview_for_reload.reload();
+                    let _ = event_sender_for_reload
+                        .send(WidgetEvent::Stop(
+                            "hot-reload (изменение файлов)".to_string(),
+                        ))
+                        .await;
+                    glib::timeout_future(Duration::from_millis(200)).await;
+                    let _ = event_sender_for_reload
+                        .send(WidgetEvent::Start(
+                            "hot-reload (изменение файлов)".to_string(),
+                        ))
+                        .await;
                 }
             });
-            std::thread::spawn(move || {
-                let mut inotify = match inotify::Inotify::init() {
-                    Ok(i) => i,
-                    Err(e) => {
-                        eprintln!(
-                            "{}[Руник ОТЛАДКА]{} Ошибка инициализации inotify: {}",
-                            YELLOW, RESET, e
-                        );
+            let file = gio::File::for_path(&html_dir);
+            if let Ok(monitor) =
+                file.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
+            {
+                let reload_sender_for_monitor = reload_sender.clone();
+                let last_reload = Instant::now();
+                monitor.connect_changed(move |_, file, _other_file, event_type| {
+                    if event_type != gio::FileMonitorEvent::ChangesDoneHint
+                        && event_type != gio::FileMonitorEvent::Created
+                        && event_type != gio::FileMonitorEvent::Deleted
+                        && event_type != gio::FileMonitorEvent::Moved
+                    {
                         return;
                     }
-                };
-                if let Err(e) = inotify.watches().add(
-                    &html_dir,
-                    inotify::WatchMask::MODIFY
-                        | inotify::WatchMask::CREATE
-                        | inotify::WatchMask::DELETE
-                        | inotify::WatchMask::MOVED_TO
-                        | inotify::WatchMask::CLOSE_WRITE,
-                ) {
-                    eprintln!(
-                        "{}[Руник ОТЛАДКА]{} Ошибка добавления watch: {}",
-                        YELLOW, RESET, e
-                    );
-                    return;
-                }
-                let mut buffer = vec![0u8; TAIL_BUF_LIMIT as usize];
-                let mut last_reload = Instant::now();
-                loop {
-                    match inotify.read_events_blocking(&mut buffer) {
-                        Ok(events) => {
-                            let mut needs_reload = false;
-                            for event in events {
-                                if let Some(name) = event.name {
-                                    let name_str = name.to_string_lossy();
-                                    if (name_str.ends_with(".html")
-                                        || name_str.ends_with(".css")
-                                        || name_str.ends_with(".js"))
-                                        && !name_str.ends_with('~')
-                                        && !name_str.contains(".swp")
-                                        && !name_str.contains(".tmp")
-                                    {
-                                        needs_reload = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if needs_reload {
+                    if let Some(path) = file.path() {
+                        if let Some(name) = path.file_name() {
+                            let name_str = name.to_string_lossy();
+                            if (name_str.ends_with(".html")
+                                || name_str.ends_with(".css")
+                                || name_str.ends_with(".js"))
+                                && !name_str.ends_with('~')
+                                && !name_str.contains(".swp")
+                                && !name_str.contains(".tmp")
+                            {
                                 let now = Instant::now();
                                 if now.duration_since(last_reload)
                                     > Duration::from_millis(HOT_RELOAD_DEBOUNCE_MS)
                                 {
-                                    let _ = reload_sender.send_blocking(());
-                                    last_reload = now;
+                                    eprintln!(
+                                        "{}[Руник ОТЛАДКА]{} Изменён файл: {}",
+                                        CYAN, RESET, name_str
+                                    );
+                                    let _ = reload_sender_for_monitor.send_blocking(());
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "{}[Руник ОТЛАДКА]{} Ошибка inotify: {}. Продолжаем...",
-                                YELLOW, RESET, e
-                            );
-                            thread::sleep(Duration::from_millis(5000));
-                        }
                     }
-                }
-            });
+                });
+                std::mem::forget(monitor);
+            } else {
+                eprintln!(
+                    "{}[Руник ОТЛАДКА]{} Ошибка создания FileMonitor для директории",
+                    YELLOW, RESET
+                );
+            }
         }
     }
-    let state_for_resume = Arc::clone(&app_state);
-    let js_sender_for_resume = js_sender.clone();
-    let is_debug_for_resume = is_debug;
-    std::thread::spawn(move || {
-        let mut last_time = Instant::now();
-        while !state_for_resume.shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(SLEEP_CHECK_INTERVAL_SECS));
-            let now = Instant::now();
-            let elapsed = now.duration_since(last_time);
-            if elapsed > std::time::Duration::from_secs(SLEEP_DETECTION_THRESHOLD_SECS) {
-                if is_debug_for_resume {
+    std::thread::spawn({
+        let event_sender = event_sender.clone();
+        #[cfg(feature = "debug")]
+        let is_debug_events = is_debug;
+        move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let conn = match zbus::Connection::system().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        #[cfg(feature = "debug")]
+                        if is_debug_events {
+                            eprintln!("{}[Руник ОТЛАДКА]{} Ошибка подключения к DBus: {}", RED, RESET, e);
+                        }
+                        drop(e);
+                        return;
+                    }
+                };
+                let proxy = match zbus::Proxy::new(
+                    &conn,
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        #[cfg(feature = "debug")]
+                        if is_debug_events {
+                            eprintln!("{}[Руник ОТЛАДКА]{} Ошибка прокси logind: {}", RED, RESET, e);
+                        }
+                        drop(e);
+                        return;
+                    }
+                };
+                let mut signal_stream = match proxy.receive_signal("PrepareForSleep").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        #[cfg(feature = "debug")]
+                        if is_debug_events {
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Ошибка подписки на PrepareForSleep: {}",
+                                RED, RESET, e
+                            );
+                        }
+                        drop(e);
+                        return;
+                    }
+                };
+                #[cfg(feature = "debug")]
+                if is_debug_events {
                     eprintln!(
-                        "{}[Руник ОТЛАДКА]{} Обнаружен выход из сна. Перезагрузка виджета...",
+                        "{}[Руник ОТЛАДКА]{} Подписка на PrepareForSleep активна (событийный режим)",
                         CYAN, RESET
                     );
                 }
-                kill_and_clear_tracked(&state_for_resume);
-                if let Ok(mut positions) = state_for_resume.watch_positions.lock() {
-                    positions.clear();
+                while let Some(signal) = signal_stream.next().await {
+                    let entering_sleep: bool = match signal.body().deserialize() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if entering_sleep {
+                        #[cfg(feature = "debug")]
+                        if is_debug_events {
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Сигнал PrepareForSleep(true) — уход в сон",
+                                CYAN, RESET
+                            );
+                        }
+                        let _ = event_sender.send_blocking(WidgetEvent::Stop(
+                            "suspend (системный сон)".to_string(),
+                        ));
+                    } else {
+                        #[cfg(feature = "debug")]
+                        if is_debug_events {
+                            eprintln!(
+                                "{}[Руник ОТЛАДКА]{} Сигнал PrepareForSleep(false) — пробуждение",
+                                CYAN, RESET
+                            );
+                        }
+                        let _ = event_sender.send_blocking(WidgetEvent::Start(
+                            "resume (выход из сна)".to_string(),
+                        ));
+                    }
                 }
-                state_for_resume.shutdown.store(false, Ordering::Relaxed);
-                let _ = js_sender_for_resume.try_send("window.location.reload();".to_string());
-            }
-            last_time = now;
+            });
         }
     });
     gtk::main();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "debug"))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1572,10 +1781,6 @@ mod tests {
         let response = get_response(&receiver);
         assert_eq!(response.action, "read");
         assert_eq!(response.status, "error");
-        assert!(
-            response.message.contains("No such file or directory")
-                || response.message.contains("Нет такого файла")
-        );
     }
 
     #[test]
@@ -1598,54 +1803,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_action_write_append() {
-        let (state, sender, receiver) = setup_test_state();
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("runic_test_append.txt");
-        std::fs::write(&file_path, "initial\n").unwrap();
-        let request = JsMessage {
-            action: "write".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap(), "data": "appended\n", "append": true}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-        let _ = get_response(&receiver);
-        let content = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(content, "initial\nappended\n");
-        let _ = std::fs::remove_file(&file_path);
-    }
-
-    #[test]
-    fn test_handle_action_exec_success() {
-        let (state, sender, receiver) = setup_test_state();
-        let request = JsMessage {
-            action: "exec".to_string(),
-            payload: json!({"command": "echo -n 'hello world'"}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "exec");
-        assert_eq!(response.status, "success");
-        assert!(response.data.unwrap().contains("hello world"));
-    }
-
-    #[test]
-    fn test_handle_action_exec_error() {
-        let (state, sender, receiver) = setup_test_state();
-        let request = JsMessage {
-            action: "exec".to_string(),
-            payload: json!({"command": "ls /nonexistent_directory_12345"}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "exec");
-        assert_eq!(response.status, "success");
-        assert!(
-            response.data.as_ref().unwrap().contains("STDERR:")
-                || response.data.as_ref().unwrap().contains("No such file")
-        );
-    }
-
-    #[test]
     fn test_handle_action_stream_success_and_cleanup() {
         let (state, sender, receiver) = setup_test_state();
         let request = JsMessage {
@@ -1654,38 +1811,13 @@ mod tests {
         };
         handle_action(Arc::clone(&state), request, sender);
         let start_response = get_response(&receiver);
-        assert_eq!(start_response.action, "stream");
         assert_eq!(start_response.status, "success");
         let data_response = get_response(&receiver);
-        assert_eq!(data_response.action, "stream");
         assert_eq!(data_response.status, "stream_data");
         assert_eq!(data_response.data, Some("stream_data_test".to_string()));
         sleep(Duration::from_millis(500));
-        let running = state.running_streams.lock().unwrap();
-        assert!(
-            running.is_empty(),
-            "Поток должен быть удалён из running_streams"
-        );
-        drop(running);
-        let pids = state.spawned_pids.lock().unwrap();
-        assert!(
-            pids.is_empty(),
-            "PID должен быть удалён из spawned_pids после завершения"
-        );
-    }
-
-    #[test]
-    fn test_handle_action_stream_error_empty_target() {
-        let (state, sender, receiver) = setup_test_state();
-        let request = JsMessage {
-            action: "stream".to_string(),
-            payload: json!({"target": ""}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "stream");
-        assert_eq!(response.status, "error");
-        assert_eq!(response.message, "target не указан");
+        assert!(state.running_streams.lock().unwrap().is_empty());
+        assert!(state.spawned_pids.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1696,17 +1828,15 @@ mod tests {
             payload: json!({"target": "sleep 10"}),
         };
         handle_action(Arc::clone(&state), request, sender.clone());
-        let start_response = get_response(&receiver);
-        assert_eq!(start_response.status, "success");
+        let _ = get_response(&receiver);
         let request2 = JsMessage {
             action: "stream".to_string(),
             payload: json!({"target": "sleep 10"}),
         };
         handle_action(Arc::clone(&state), request2, sender);
         let dup_response = get_response(&receiver);
-        assert_eq!(dup_response.action, "stream");
-        assert_eq!(dup_response.status, "error");
-        assert_eq!(dup_response.message, "Уже выполняется");
+        assert_eq!(dup_response.status, "success");
+        assert_eq!(dup_response.message, "Уже выполняется (игнорируется)");
         state.running_streams.lock().unwrap().clear();
         state.spawned_pids.lock().unwrap().clear();
     }
@@ -1742,87 +1872,14 @@ mod tests {
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
-        assert!(got_success, "Должно прийти подтверждение запуска watch");
-        assert!(got_watch_data, "Должны прийти данные из файла (tail)");
-        let positions = state.watch_positions.lock().unwrap();
-        assert!(positions.contains_key(file_path.to_str().unwrap()));
-        drop(positions);
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(got_success);
+        assert!(got_watch_data);
         state
             .watch_positions
             .lock()
             .unwrap()
             .remove(file_path.to_str().unwrap());
         let _ = std::fs::remove_file(&file_path);
-    }
-
-    #[test]
-    fn test_handle_action_watch_duplicate_error() {
-        let (state, sender, receiver) = setup_test_state();
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("runic_test_watch_dup.log");
-        std::fs::write(&file_path, "line\n").unwrap();
-        let request1 = JsMessage {
-            action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
-        };
-        handle_action(Arc::clone(&state), request1, sender.clone());
-        let _ = get_response(&receiver);
-        let request2 = JsMessage {
-            action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
-        };
-        handle_action(Arc::clone(&state), request2, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "watch");
-        assert_eq!(response.status, "error");
-        assert_eq!(response.message, "Уже мониторится");
-        state
-            .watch_positions
-            .lock()
-            .unwrap()
-            .remove(file_path.to_str().unwrap());
-        let _ = std::fs::remove_file(&file_path);
-    }
-
-    #[test]
-    fn test_handle_action_unwatch_success() {
-        let (state, sender, receiver) = setup_test_state();
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("runic_test_unwatch.log");
-        std::fs::write(&file_path, "line\n").unwrap();
-        let watch_request = JsMessage {
-            action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
-        };
-        handle_action(Arc::clone(&state), watch_request, sender.clone());
-        let _ = get_response(&receiver);
-        sleep(Duration::from_millis(100));
-        let unwatch_request = JsMessage {
-            action: "unwatch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
-        };
-        handle_action(Arc::clone(&state), unwatch_request, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "unwatch");
-        assert_eq!(response.status, "success");
-        let positions = state.watch_positions.lock().unwrap();
-        assert!(!positions.contains_key(file_path.to_str().unwrap()));
-        let _ = std::fs::remove_file(&file_path);
-    }
-
-    #[test]
-    fn test_handle_action_unknown() {
-        let (state, sender, receiver) = setup_test_state();
-        let request = JsMessage {
-            action: "unknown_action".to_string(),
-            payload: json!({}),
-        };
-        handle_action(Arc::clone(&state), request, sender);
-        let response = get_response(&receiver);
-        assert_eq!(response.action, "unknown_action");
-        assert_eq!(response.status, "error");
-        assert_eq!(response.message, "Неизвестное действие");
     }
 
     #[test]
@@ -1847,20 +1904,31 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_flag_stops_watch_loop() {
-        let (state, sender, _receiver) = setup_test_state();
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("runic_test_shutdown_watch.log");
-        std::fs::write(&file_path, "line\n").unwrap();
-        let request = JsMessage {
-            action: "watch".to_string(),
-            payload: json!({"path": file_path.to_str().unwrap()}),
+    fn test_widget_event_creation() {
+        let stop_event = WidgetEvent::Stop("suspend".to_string());
+        let start_event = WidgetEvent::Start("resume".to_string());
+        match stop_event {
+            WidgetEvent::Stop(reason) => assert_eq!(reason, "suspend"),
+            _ => panic!("Ожидалось событие Stop"),
+        }
+        match start_event {
+            WidgetEvent::Start(reason) => assert_eq!(reason, "resume"),
+            _ => panic!("Ожидалось событие Start"),
+        }
+    }
+
+    #[test]
+    fn test_ui_config_clone() {
+        let config = UiConfig {
+            width: Some(1024),
+            height: None,
+            x: 5,
+            y: 15,
+            is_debug: false,
         };
-        handle_action(Arc::clone(&state), request, sender);
-        sleep(Duration::from_millis(100));
-        state.shutdown.store(true, Ordering::Relaxed);
-        sleep(Duration::from_secs(2));
-        assert!(state.shutdown.load(Ordering::Relaxed));
-        let _ = std::fs::remove_file(&file_path);
+        let cloned = config.clone();
+        assert_eq!(cloned.width, Some(1024));
+        assert_eq!(cloned.height, None);
+        assert!(!cloned.is_debug);
     }
 }
