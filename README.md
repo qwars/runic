@@ -5,49 +5,31 @@ A lightweight engine for rendering HTML/CSS/JS widgets on Linux desktops. A mode
 Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 
 ## Features
-
 - **True web rendering** — HTML5, CSS3, modern JavaScript via WebKitGTK
 - **Layer Shell integration** — widgets sit below all windows (or on other layers)
 - **Transparent background** — widgets blend seamlessly into the desktop
 - **Powerful IPC bridge** — 8 built-in actions: file read/write, command execution, streaming output, file monitoring, and stream control
 - **Flexible positioning** — custom size, coordinates, fullscreen mode
-- **Quiet mode** — no log spam by default, debug output enabled with `--debug` flag
+- **Dual Build Modes** — minimal production binary or full debug version (via Cargo features)
 - **Async streaming** — long-running command output flows to widgets in real-time
-- **File monitoring via inotify** — track file changes without polling (zero CPU load while idle)
-- **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (in `--debug` mode)
-- **Sleep wake detector** — automatic widget reload after system wake-up
+- **File monitoring via gio** — track file changes without polling (zero CPU load while idle)
+- **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (debug builds only)
+- **Event-driven Sleep Detector (DBus)** — instant reaction to system suspend/resume via `systemd-logind` signals, no polling overhead
 
-## 🚀 Performance (v1.4.0)
-
+## 🚀 Performance (v1.5.0)
 The project is optimized for minimal resource consumption:
+| Metric | Value |
+|---|---|
+| Peak memory at startup | ~30-50 MB |
+| Thread count | 8-12 (fixed pool) |
+| Idle CPU | <0.1% (event-driven DBus instead of polling) |
+| IPC response time | <1 ms |
+| Zombie processes | None (Process Groups + ChildGuard) |
 
-| Metric                 | Value                              |
-|------------------------|------------------------------------|
-| Peak memory at startup | ~30-50 MB                          |
-| Thread count           | 8-12 (fixed pool)                  |
-| Idle CPU               | <1%                                |
-| IPC response time      | <1 ms                              |
-| Zombie processes       | None (Process Groups + ChildGuard) |
-
-- **ThreadPool**: a fixed pool of 8 worker threads handles all IPC requests. Eliminated ~800 MB memory consumption and kernel scheduler overhead.
-- **Process Groups**: all `sh -c` commands are launched in a separate process group. On termination, the entire group receives `SIGTERM`/`SIGKILL` — child processes (e.g., `tail -f`, `ping`) no longer become orphans.
-- **ChildGuard**: every child process is wrapped in a `ChildGuard` structure with `Drop` implementation, which guarantees process termination on any exit (normal or via panic). This prevents orphan processes even in case of failures.
-- **Directory debouncing**: 500 ms time-based debounce prevents inotify notification storms when scripts trigger events in monitored directories.
-- **Non-blocking channels**: `try_send` instead of `send_blocking` eliminates potential deadlocks when GTK main loop hangs.
-- **Monotonic clocks**: `Instant` instead of `SystemTime` for the sleep detector — correct behavior during system clock adjustments and NTP synchronization.
-
-## 🛡️ Reliability & Security (v1.4.0)
-
-The project undergoes continuous security and stability audits:
-
-- **Resource Profiling**: Built-in tracking of memory (VmRSS) and CPU time (`getrusage`) for every IPC request, logged when thresholds are exceeded.
-- **Thread Tracking (`ThreadTracker`)**: Comprehensive monitoring of active and completed background threads, including peak memory, lifespan, and task count, preventing silent resource exhaustion.
-- **Colored Debug Output**: ANSI-colored console logs for instant visual parsing of Errors (🔴), Warnings (🟡), Success (🟢), Debug info (🔵), and Profiling data (🟣).
-- **Atomic process management**: Eliminated TOCTOU (Time-of-Check to Time-of-Use) race conditions when launching streaming commands. Repeated `stream` calls with the same argument are now guaranteed to be blocked.
-- **Safe resource cleanup via ChildGuard**: all child processes are wrapped in `ChildGuard`, which guarantees their termination on any exit (normal or via panic). Eliminated the possibility of orphan processes even in case of failures.
-- **Fail-fast on panics**: when a mutex is poisoned, the application panics, preventing work with inconsistent state. All child processes are automatically killed via the `Drop` mechanism.
-- **Graceful Shutdown**: All background threads receive a stop signal and terminate cleanly, leaving no zombie processes or memory leaks.
-- **Code Quality**: The codebase fully complies with strict `cargo clippy -- -D warnings` checks and includes 15 comprehensive unit tests.
+**Architectural Optimizations:**
+- **Event-driven DBus (`PrepareForSleep`):** Instant widget sleep/wake without background timers.
+- **gio::FileMonitor:** Hot-reload runs in the GLib context, eliminating extra threads for `inotify`.
+- **Build Split:** Production builds completely strip out debug, profiling, and hot-reload code, reducing binary size and memory footprint.
 
 ## Requirements
 
@@ -74,14 +56,18 @@ sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
 sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
 ```
 
-### 2. Build
 
+### 2. Build
 ```bash
 git clone https://github.com/qwars/runic.git
 cd runic
-cargo build --release
-```
 
+# Minimal production build (no hot-reload, no debug logging)
+cargo build --release
+
+# Full debug build (with hot-reload, thread stats, and logs)
+cargo build --release --features debug
+```
 The binary will be at `target/release/runic`.
 
 ## Usage
@@ -103,15 +89,14 @@ The binary will be at `target/release/runic`.
 ```
 
 ### Command-line arguments
-
-| Argument           | Description                                           | Default    |
-|--------------------|-------------------------------------------------------|------------|
-| `html_path`        | Path to the widget HTML file                          | (required) |
-| `-w, --width <N>`  | Window width in pixels                                | fullscreen |
-| `-H, --height <N>` | Window height in pixels                               | fullscreen |
-| `-x, --x <N>`      | Offset from left edge                                 | 0          |
-| `-y, --y <N>`      | Offset from top edge                                  | 0          |
-| `-d, --debug`      | Enable verbose output, colored logs, and thread stats | false      |
+| Argument         | Description                                                         | Default    |
+|------------------|---------------------------------------------------------------------|------------|
+| html_path        | Path to the widget HTML file                                        | (required) |
+| -w, --width <N>  | Window width in pixels                                              | fullscreen |
+| -H, --height <N> | Window height in pixels                                             | fullscreen |
+| -x, --x <N>      | Offset from left edge                                               | 0          |
+| -y, --y <N>      | Offset from top edge                                                | 0          |
+| -d, --debug      | Enable verbose output (only works if built with `--features debug`) | false      |
 
 **Note**: `-x` and `-y` coordinates only work when window size is specified (`-w` and `-H`).
 
@@ -224,16 +209,15 @@ Response: Stops monitoring a file previously started via `watch`. The inotify th
 
 Response: Returns a summary of active and completed threads — peak memory usage, lifespan, and task count.
 
-## Debug mode
-
-The `--debug` flag enables:
-
+### Debug mode
+The `--debug` flag (available only in builds compiled with `--features debug`) enables:
 - All IPC messages printed to the terminal with colored formatting.
 - `console.log` from JS redirected to stdout.
-- Size and positioning information.
-- **Thread statistics**: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds. Includes lifespan of each thread in milliseconds.
-- **Hot-reload**: automatic widget reload when `.html`, `.css`, `.js` files change in the widget directory (300ms debounce protection).
-- **Profiling**: performance metrics logged when thresholds are exceeded.
+- Thread statistics: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds.
+- Hot-reload: automatic widget reload when `.html`, `.css`, `.js` files change (300ms debounce protection).
+- Profiling: performance metrics logged when thresholds are exceeded.
+
+*Note: In a standard release build (without the `debug` feature), the `-d` flag is ignored, and the program runs completely silently.*
 
 ### Extended execution result logging:
 
