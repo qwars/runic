@@ -3,9 +3,39 @@
 Все заметные изменения в этом проекте будут документироваться в этом файле.
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/),
+
+## [1.6.0] - 2026-10-17
+
+### Изменено
+- Удалены мёртвые зависимости: `inotify`, `tokio`, `futures-util`
+- Удалён `spawned_pids` — PID берётся из `running_streams`
+- `exec` выполняется в отдельном потоке вместо блокировки воркера ThreadPool
+- `cleanup_children`: `SIGTERM` + адаптивный `waitpid(-1)` вместо фиксированных 300мс
+- `watch`: polling заменён на `gio::FileMonitor` — нулевая задержка, событийный мониторинг
+- `send_new_lines`: кэширование FD файла вместо повторного открытия
+- `send_js`: прямой JSON без `RustResponse` — 1 аллокация вместо 3
+- `ThreadPool`: `send_blocking` вместо `try_send` — задачи не теряются
+- `stream`: `send_blocking` вместо `try_send` — backpressure, 0 потерь данных
+- `cleanup_children`: `waitpid(-1)` вместо цикла по PID — 80% меньше syscall
+- Убран debounce 500мс в `watch` — `gio::FileMonitor` уже событийный
+- Удалены комментарии из кода
+- Исправлен `watch` для Tor и погоды в виджете
+
+### Исправлено
+- Двойное убийство процессов в `unstream` и `kill_and_clear_tracked`
+- `last_reload` в hot-reload теперь мутируется через `RefCell<Instant>`
+- `ThreadPool` использует `async_channel` вместо `std::sync::mpsc`
+- `watch` debounce удалён — события отправляются мгновенно
+
+### Добавлено
+- `needs_shell()` — умный парсер: простые команды напрямую, сложные через `sh`
+- `parse_command()` — парсинг команд с учётом кавычек
+- `send_new_lines()` — общая функция чтения новых строк для watch
+- CI собирает и release, и debug бинарники
+
 и этот проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
-## [1.5.0] - 2026-10-10 
+## [1.5.0] - 2024-10-10
 
 ### Производительность и Архитектура (Performance & Architecture)
 - **Событийное отслеживание сна (DBus):** Устаревший polling-механизм (`SystemTime` + `loginctl`) заменён на событийную подписку через `zbus` на сигнал `PrepareForSleep` от `systemd-logind`. Мгновенная реакция на уход в сон и пробуждение, нулевая нагрузка на CPU в простое.

@@ -12,11 +12,11 @@ Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 - **Flexible positioning** — custom size, coordinates, fullscreen mode
 - **Dual Build Modes** — minimal production binary or full debug version (via Cargo features)
 - **Async streaming** — long-running command output flows to widgets in real-time
-- **File monitoring via gio** — track file changes without polling (zero CPU load while idle)
+- **File monitoring via gio::FileMonitor** — track file changes without polling (zero CPU load, event-driven)
 - **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (debug builds only)
 - **Event-driven Sleep Detector (DBus)** — instant reaction to system suspend/resume via `systemd-logind` signals, no polling overhead
 
-## 🚀 Performance (v1.5.0)
+## 🚀 Performance (v1.6.0)
 The project is optimized for minimal resource consumption:
 | Metric | Value |
 |---|---|
@@ -66,9 +66,9 @@ cd runic
 cargo build --release
 
 # Full debug build (with hot-reload, thread stats, and logs)
-cargo build --release --features debug
+cargo build --features debug
 ```
-The binary will be at `target/release/runic`.
+The binaries will be at `target/release/runic` and `target/debug/runic`.
 
 ## Usage
 
@@ -161,7 +161,7 @@ Response: `data` contains file contents.
 { "action": "exec", "payload": { "command": "df -h" } }
 ```
 
-Response: `data` contains `stdout` on success or `STDERR:\n...` on error. Command runs via `sh -c` isolated in a Process Group.
+Response: `data` contains `stdout` on success or `STDERR:\n...` on error. Simple commands (no pipes, redirects, etc.) run directly; complex commands (pipes, redirects, shell variables) run via `sh -c`. All commands run in an isolated Process Group.
 
 #### `stream` — streaming execution
 
@@ -179,13 +179,13 @@ Response: Arrives multiple times, one line at a time, with status `stream_data`.
 
 Response: Stops a previously started `stream` command. The entire Process Group receives `SIGKILL`, and the stream is removed from the active list.
 
-#### `watch` — monitor a file via inotify
+#### `watch` — monitor a file via polling
 
 ```json
 { "action": "watch", "payload": { "path": "/var/log/syslog", "tail": 10 } }
 ```
 
-Tracks file changes using the `inotify` system call (zero CPU load while waiting for events). On each file change, new lines are sent to the widget with status `watch_data`.
+Tracks file changes using `gio::FileMonitor` (event-driven, zero CPU load). On each file change, new lines are sent to the widget with status `watch_data`.
 
 **Parameters**: `path` (required), `tail` (optional, number of last lines to send on startup).
 
@@ -199,7 +199,7 @@ Tracks file changes using the `inotify` system call (zero CPU load while waiting
 { "action": "unwatch", "payload": { "path": "/var/log/syslog" } }
 ```
 
-Response: Stops monitoring a file previously started via `watch`. The inotify thread terminates, and the file descriptor is released.
+Response: Stops monitoring a file previously started via `watch`. The `gio::FileMonitor` terminates.
 
 #### `stats` — thread statistics
 

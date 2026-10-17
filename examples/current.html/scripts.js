@@ -364,7 +364,7 @@ done`;
 
 // TOR: 300с
 const targetTorStatus = `while true; do
-  if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 5 https://check.torproject.org/api/ip | grep -q '"IsTor":true'; then
+  if curl -s -m 5 -x socks5h://127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '"IsTor":true'; then
     echo "⎈"
   else
     echo "∅"
@@ -374,13 +374,15 @@ done`;
 
 // ПОГОДА: 3600с
 const targetWeatherStatus = `while true; do
-  DATA=$(curl -s -m 3 'wttr.in/?format=1&lang=ru')
-  if [ -n "$DATA" ] && [ "$DATA" != "Unknown location;" ]; then
-    echo "$DATA"
-    sleep 3600
-  else
-    sleep 10
-  fi
+  for i in 1 2 3; do
+    DATA=$(curl -s -m 10 'wttr.in/?format=1&lang=ru')
+    if [ -n "$DATA" ] && [ "$DATA" != "Unknown location;" ]; then
+      echo "$DATA"
+      sleep 3600
+    else
+      sleep 10
+    fi
+  done
 done`;
 
 // ГАРНИТУРА: 120с
