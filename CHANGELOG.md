@@ -4,6 +4,24 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/),
 
+## [1.7.0] - 2026-10-19
+
+### Изменено
+- `parse_command()` заменён на `shlex::split` — корректная обработка кавычек, экранирования и `$`-переменных
+- `RustResponse` перенесён за `#[cfg(test)]` — в production только `CompactResponse` с lifetime-ами
+- `mem::zeroed()` для `rusage` заменён на `MaybeUninit::zeroed().assume_init()` — безопаснее на архитектурах с padding
+- `stderr` в `stream` теперь feature-gated: `Stdio::piped` в debug, `Stdio::null` в release
+
+### Исправлено
+- ThreadTracker: `register_thread` / `finish_thread` восстановлены в `exec` и `stream` — все ветки (success, error, duplicate) корректно завершают трекинг
+- Hot-reload: `gio::FileMonitor` теперь управляется через `gio::Cancellable` вместо `std::mem::forget` — корректная очистка при shutdown
+- `AppState` дополнен `watch_cancellables` и `hot_reload_cancellable` — отмена всех мониторов через `kill_and_clear_tracked`
+
+### Добавлено
+- Зависимость `shlex = "2.0.1"`
+- Тесты: `test_stream_real_process_multiple_lines`, `test_watch_file_modification`, `test_thread_tracker_consistency`, `test_exec_thread_tracker_on_error`
+- Обновлены repository URLs на GitHub
+
 ## [1.6.0] - 2026-10-17
 
 ### Изменено

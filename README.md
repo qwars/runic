@@ -179,7 +179,7 @@ Response: Arrives multiple times, one line at a time, with status `stream_data`.
 
 Response: Stops a previously started `stream` command. The entire Process Group receives `SIGKILL`, and the stream is removed from the active list.
 
-#### `watch` — monitor a file via polling
+#### `watch` — monitor a file via gio::FileMonitor
 
 ```json
 { "action": "watch", "payload": { "path": "/var/log/syslog", "tail": 10 } }

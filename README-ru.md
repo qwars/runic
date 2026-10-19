@@ -178,7 +178,7 @@ window.onRunicResponse = function (response) {
 
 Ответ: Останавливает ранее запущенную команду `stream`. Вся Process Group получает `SIGKILL`, поток удаляется из списка активных.
 
-#### `watch` — мониторинг файла через inotify
+#### `watch` — мониторинг файла через gio::FileMonitor
 
 ```json
 { "action": "watch", "payload": { "path": "/var/log/syslog", "tail": 10 } }
