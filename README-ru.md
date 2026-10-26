@@ -2,7 +2,7 @@
 
 Легковесный движок для отображения HTML/CSS/JS виджетов на рабочем столе Linux. Современная альтернатива Conky с веб-стеком: пишите виджеты на привычных HTML, CSS и JavaScript, а Runic обеспечит интеграцию с системой через прозрачный IPC-мост.
 
-Построен на Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
+Построен на Rust + GTK4 + WebKitGTK 6.0 + JavaScriptCore6 + Layer Shell (Wayland).
 
 ## Возможности
 - **Настоящий веб-рендеринг** — HTML5, CSS3, современный JavaScript через WebKitGTK
@@ -10,13 +10,12 @@
 - **Прозрачный фон** — виджеты органично вписываются в рабочий стол
 - **Мощный IPC-мост** — 8 действий из коробки: чтение/запись файлов, выполнение команд, потоковый вывод, мониторинг файлов и управление потоками
 - **Гибкое позиционирование** — размер, координаты, полноэкранный режим
-- **Два режима сборки** — облегченный релизный бинарник и полная версия для разработки (через Cargo features)
 - **Асинхронный стриминг** — вывод долгоиграющих команд поступает в виджет в реальном времени
 - **Мониторинг файлов через gio::FileMonitor** — отслеживание изменений без опроса (нулевая нагрузка на CPU, событийный режим)
-- **Hot-reload** — автоматическая перезагрузка виджета при изменении `.html`, `.css` или `.js` файлов (только в debug-сборке)
+- **Hot-reload** — автоматическая перезагрузка виджета при изменении `.html`, `.css` или `.js` файлов
 - **Событийный детектор сна (DBus)** — мгновенная реакция на уход в сон и пробуждение системы через `systemd-logind` без polling'а
 
-## 🚀 Производительность (v1.6.0)
+## 🚀 Производительность (v2.0.0)
 Проект оптимизирован для минимального потребления ресурсов:
 | Метрика | Значение |
 |---|---|
@@ -24,18 +23,18 @@
 | Количество потоков | 8-12 (фиксированный пул) |
 | CPU в простое | <0.1% (событийный DBus вместо polling) |
 | Время отклика IPC | <1 мс |
-| Процессы-зомби | Нет (Process Groups + ChildGuard) |
+| Процессы-зомби | Нет (Process Groups + ProcessGuard) |
 
 **Архитектурные оптимизации:**
 - **Событийный DBus (`PrepareForSleep`):** Мгновенное засыпание и пробуждение виджета без фоновых таймеров.
 - **gio::FileMonitor:** Hot-reload работает в контексте GLib, не создавая отдельных потоков для `inotify`.
-- **Разделение сборок:** В production-сборке полностью вырезан код отладки, профилирования и hot-reload, что уменьшает размер бинарника и потребление памяти.
+- **ProcessGuard с адаптивным kill:** Process Groups с `SIGTERM` + адаптивное ожидание + `SIGKILL` — ноль процессов-зомби.
 
 ## Требования
 
 - **ОС**: Linux с Wayland-композитором (Sway, Hyprland, Wayfire и т.п.)
-- **Системные библиотеки**: GTK 3.24+, WebKitGTK 4.1, gtk-layer-shell
-- **Rust**: 1.70+ (для сборки)
+- **Системные библиотеки**: GTK 4.14+, WebKitGTK 6.0, gtk4-layer-shell
+- **Rust**: 1.80+ (для сборки, edition 2024)
 
 ## Установка
 
@@ -43,17 +42,17 @@
 
 **Debian 13 / Ubuntu:**
 ```bash
-sudo apt install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
+sudo apt install -y build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libgtk4-layer-shell-dev
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
+sudo pacman -S gtk4 webkitgtk-6.0 gtk4-layer-shell
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
+sudo dnf install gtk4-devel webkitgtk6.0-devel gtk4-layer-shell-devel
 ```
 
 ### 2. Сборка
@@ -61,13 +60,15 @@ sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
 git clone https://github.com/qwars/runic.git
 cd runic
 
-# Облегченная версия для продакшена (без hot-reload и отладки)
+# Сборка релизной версии
 cargo build --release
-
-# Полная версия для разработки (с hot-reload, статистикой и логами)
-cargo build --features debug
 ```
-Бинарники появятся в `target/release/runic` и `target/debug/runic`.
+Бинарник появится в `target/release/runic`.
+
+Для запуска с отладкой (горячая перезагрузка, IPC-трассировка):
+```bash
+cargo run -- examples/test.html/index.html --debug
+```
 
 ## Использование
 
@@ -83,7 +84,7 @@ cargo build --features debug
 # С отступом от краёв
 ./target/release/runic examples/test.html/index.html -w 400 -H 300 -x 50 -y 100
 
-# Режим отладки
+# Режим отладки (подробный вывод с логами и профилированием)
 ./target/release/runic examples/test.html/index.html --debug
 ```
 
@@ -95,7 +96,7 @@ cargo build --features debug
 | -H, --height <N> | Высота окна в пикселях                                                       | на весь экран |
 | -x, --x <N>      | Отступ от левого края                                                        | 0             |
 | -y, --y <N>      | Отступ от верхнего края                                                      | 0             |
-| -d, --debug      | Включить подробный вывод (работает только если собрано с `--features debug`) | false         |
+| -d, --debug      | Включить подробный вывод (логи, IPC-трассировка, профилирование)   | false         |
 
 **Примечание**: координаты `-x` и `-y` работают только если задан размер окна (`-w` и `-H`).
 
@@ -200,23 +201,22 @@ window.onRunicResponse = function (response) {
 
 Ответ: Останавливает мониторинг файла, запущенный ранее через `watch`. `gio::FileMonitor` завершается.
 
-#### `stats` — статистика потоков
+#### `stats` — статистика выполнения
 
 ```json
 { "action": "stats" }
 ```
 
-Ответ: Возвращает сводку по активным и завершённым потокам — пиковое потребление памяти, время жизни, количество выполненных задач.
+Ответ: Возвращает текущие счётчики активных streams, watchers, executions и длину очереди задач.
 
 ### Режим отладки
-Флаг `--debug` (доступен только в сборке с `--features debug`) включает:
-- Вывод всех IPC-сообщений в терминал с цветным форматированием.
+Флаг `--debug` включает подробный вывод через `env_logger`:
+- Вывод всех IPC-сообщений в терминал со структурированным логированием.
 - Перенаправление `console.log` из JS в stdout.
-- Статистику потоков (сводка по активным/завершённым потокам, памяти и CPU каждые 30 секунд).
 - Hot-reload: автоматическая перезагрузка виджета при изменении файлов `.html`, `.css`, `.js` (защита от дребезга — 300 мс).
-- Профилирование: вывод метрик производительности при превышении порогов.
+- STDOUT/stderr потоковых команд логируются.
 
-*Примечание: В обычной release-сборке (без фичи `debug`) флаг `-d` игнорируется, программа работает абсолютно тихо.*
+*Примечание: Без `--debug` программа работает тихо — никакого вывода в консоль (кроме критических ошибок запуска).*
 
 ### Расширенное логирование результатов выполнения:
 
@@ -230,21 +230,12 @@ window.onRunicResponse = function (response) {
 ### Пример вывода в режиме отладки:
 
 ```
-[Руник ОТЛАДКА] Режим отладки включен
-[Руник ОТЛАДКА] Обработчик 'ipc' зарегистрирован: true
-[Руник ОТЛАДКА] Получено: {"action":"exec","payload":{"command":"uname -a"}}
-[Руник ОТЛАДКА] exec запуск: 'uname -a'
-[Руник РЕЗУЛЬТАТ] exec 'uname -a' => код выхода: Some(0), 15мс, вывод: 'Linux hostname 6.1.0...'
-[Руник Профиль] 'exec' выполнен за 15ms | Память: 45200 KB | CPU: 120 ms
+2026-10-26 12:00:00.123 DEBUG [runic] ipc {"action":"exec","payload":{"command":"uname -a"}}
+2026-10-26 12:00:00.125 DEBUG [runic] read 'examples/test.html/index.html' => 1024 bytes
+2026-10-26 12:00:00.130 DEBUG [runic] exec 'uname -a' => code: 0, output: 'Linux hostname 6.1.0...'
 ```
 
-### Запуск в режиме отладки:
-
-```bash
-cargo run -- examples/test.html/index.html --debug
-```
-
-**Важно**: В обычном режиме (без `--debug`) программа работает тихо — не выводит ничего в консоль и не отправляет ошибки в виджет (кроме критических ошибок запуска). Это позволяет использовать Runic в production без засорения логов.
+**Важно**: В обычном режиме (без `--debug`) программа работает тихо — не выводит ничего в консоль (кроме критических ошибок запуска). Это позволяет использовать Runic в production без засорения логов.
 
 ## Лицензия
 
@@ -254,6 +245,6 @@ MIT
 
 Проект вдохновлён [Conky](https://github.com/brndnmtthws/conky) и построен на отличных Rust-привязках:
 
-- [gtk-rs](https://github.com/gtk-rs/gtk3-rs)
-- [webkit2gtk-rs](https://github.com/nicokosi/webkit2gtk-rs)
-- [gtk-layer-shell-rs](https://github.com/Smithay/gtk-layer-shell-rs)
+- [gtk4-rs](https://github.com/gtk-rs/gtk4-rs)
+- [webkit6-rs](https://crates.io/crates/webkit6)
+- [gtk4-layer-shell-rs](https://github.com/Smithay/gtk4-layer-shell-rs)
