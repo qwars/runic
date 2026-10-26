@@ -2,7 +2,7 @@
 
 A lightweight engine for rendering HTML/CSS/JS widgets on Linux desktops. A modern alternative to Conky with a web stack: write widgets using familiar HTML, CSS, and JavaScript, while Runic handles system integration through a transparent IPC bridge.
 
-Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
+Built with Rust + GTK4 + WebKitGTK 6.0 + JavaScriptCore6 + Layer Shell (Wayland).
 
 ## Features
 - **True web rendering** — HTML5, CSS3, modern JavaScript via WebKitGTK
@@ -10,13 +10,12 @@ Built with Rust + GTK3 + WebKitGTK + Layer Shell (Wayland).
 - **Transparent background** — widgets blend seamlessly into the desktop
 - **Powerful IPC bridge** — 8 built-in actions: file read/write, command execution, streaming output, file monitoring, and stream control
 - **Flexible positioning** — custom size, coordinates, fullscreen mode
-- **Dual Build Modes** — minimal production binary or full debug version (via Cargo features)
 - **Async streaming** — long-running command output flows to widgets in real-time
 - **File monitoring via gio::FileMonitor** — track file changes without polling (zero CPU load, event-driven)
-- **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change (debug builds only)
+- **Hot-reload** — automatic widget reload when `.html`, `.css`, or `.js` files change
 - **Event-driven Sleep Detector (DBus)** — instant reaction to system suspend/resume via `systemd-logind` signals, no polling overhead
 
-## 🚀 Performance (v1.6.0)
+## 🚀 Performance (v2.0.0)
 The project is optimized for minimal resource consumption:
 | Metric | Value |
 |---|---|
@@ -24,18 +23,18 @@ The project is optimized for minimal resource consumption:
 | Thread count | 8-12 (fixed pool) |
 | Idle CPU | <0.1% (event-driven DBus instead of polling) |
 | IPC response time | <1 ms |
-| Zombie processes | None (Process Groups + ChildGuard) |
+| Zombie processes | None (Process Groups + ProcessGuard) |
 
 **Architectural Optimizations:**
 - **Event-driven DBus (`PrepareForSleep`):** Instant widget sleep/wake without background timers.
 - **gio::FileMonitor:** Hot-reload runs in the GLib context, eliminating extra threads for `inotify`.
-- **Build Split:** Production builds completely strip out debug, profiling, and hot-reload code, reducing binary size and memory footprint.
+- **ProcessGuard with adaptive kill:** Process groups with `SIGTERM` + adaptive wait + `SIGKILL` — zero zombie processes.
 
 ## Requirements
 
 - **OS**: Linux with Wayland compositor (Sway, Hyprland, Wayfire, etc.)
-- **System libraries**: GTK 3.24+, WebKitGTK 4.1, gtk-layer-shell
-- **Rust**: 1.70+ (for building)
+- **System libraries**: GTK 4.14+, WebKitGTK 6.0, gtk4-layer-shell
+- **Rust**: 1.80+ (for building, edition 2024)
 
 ## Installation
 
@@ -43,17 +42,17 @@ The project is optimized for minimal resource consumption:
 
 **Debian 13 / Ubuntu:**
 ```bash
-sudo apt install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
+sudo apt install -y build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libgtk4-layer-shell-dev
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S gtk3 webkit2gtk gtk-layer-shell
+sudo pacman -S gtk4 webkitgtk-6.0 gtk4-layer-shell
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
+sudo dnf install gtk4-devel webkitgtk6.0-devel gtk4-layer-shell-devel
 ```
 
 
@@ -62,13 +61,14 @@ sudo dnf install gtk3-devel webkit2gtk4.1-devel gtk-layer-shell-devel
 git clone https://github.com/qwars/runic.git
 cd runic
 
-# Minimal production build (no hot-reload, no debug logging)
 cargo build --release
-
-# Full debug build (with hot-reload, thread stats, and logs)
-cargo build --features debug
 ```
-The binaries will be at `target/release/runic` and `target/debug/runic`.
+The binary will be at `target/release/runic`.
+
+For verbose debug output (hot-reload, IPC tracing, profiling):
+```bash
+cargo run -- examples/test.html/index.html --debug
+```
 
 ## Usage
 
@@ -84,7 +84,7 @@ The binaries will be at `target/release/runic` and `target/debug/runic`.
 # With offset from edges
 ./target/release/runic examples/test.html/index.html -w 400 -H 300 -x 50 -y 100
 
-# Debug mode (verbose terminal output with colored logs and profiling)
+# Debug mode (verbose terminal output with logs and profiling)
 ./target/release/runic examples/test.html/index.html --debug
 ```
 
@@ -96,7 +96,7 @@ The binaries will be at `target/release/runic` and `target/debug/runic`.
 | -H, --height <N> | Window height in pixels                                             | fullscreen |
 | -x, --x <N>      | Offset from left edge                                               | 0          |
 | -y, --y <N>      | Offset from top edge                                                | 0          |
-| -d, --debug      | Enable verbose output (only works if built with `--features debug`) | false      |
+| -d, --debug      | Enable verbose debug output (logs, IPC trace, profiling)            | false      |
 
 **Note**: `-x` and `-y` coordinates only work when window size is specified (`-w` and `-H`).
 
@@ -201,51 +201,32 @@ Tracks file changes using `gio::FileMonitor` (event-driven, zero CPU load). On e
 
 Response: Stops monitoring a file previously started via `watch`. The `gio::FileMonitor` terminates.
 
-#### `stats` — thread statistics
+#### `stats` — runtime statistics
 
 ```json
 { "action": "stats" }
 ```
 
-Response: Returns a summary of active and completed threads — peak memory usage, lifespan, and task count.
+Response: Returns current counts of active streams, watchers, executions, and the task queue length.
 
 ### Debug mode
-The `--debug` flag (available only in builds compiled with `--features debug`) enables:
-- All IPC messages printed to the terminal with colored formatting.
+The `--debug` flag enables verbose debug output via `env_logger`:
+- All IPC messages printed to the terminal with structured logging.
 - `console.log` from JS redirected to stdout.
-- Thread statistics: A summary of active/completed threads, memory, and CPU usage printed every 30 seconds.
 - Hot-reload: automatic widget reload when `.html`, `.css`, `.js` files change (300ms debounce protection).
-- Profiling: performance metrics logged when thresholds are exceeded.
+- STDOUT/stderr from streamed commands captured and logged.
 
-*Note: In a standard release build (without the `debug` feature), the `-d` flag is ignored, and the program runs completely silently.*
-
-### Extended execution result logging:
-
-- 🔵 `read`: path, file size, content preview (first 100 characters), execution time
-- 🔵 `write`: path, bytes written, mode (append/truncate), execution time
-- 🔵 `exec`: command, exit code, output preview (first 200 characters), execution time
-- 🔵 `stream`: process PID, each line from stdout/stderr, completion status with line count
-- 🔵 `watch`: object type (file/directory), data from tail, each detected change, completion status with event count
-- 🔵 `unstream`/`unwatch`: stop result with PID or path
+*Note: Without `--debug`, the program runs silently — no console output (except critical startup errors).*
 
 ### Example debug output:
 
 ```
-[Руник ОТЛАДКА] Режим отладки включен
-[Руник ОТЛАДКА] Обработчик 'ipc' зарегистрирован: true
-[Руник ОТЛАДКА] Получено: {"action":"exec","payload":{"command":"uname -a"}}
-[Руник ОТЛАДКА] exec запуск: 'uname -a'
-[Руник РЕЗУЛЬТАТ] exec 'uname -a' => код выхода: Some(0), 15мс, вывод: 'Linux hostname 6.1.0...'
-[Руник Профиль] 'exec' выполнен за 15ms | Память: 45200 KB | CPU: 120 ms
+2026-10-26 12:00:00.123 DEBUG [runic] ipc {"action":"exec","payload":{"command":"uname -a"}}
+2026-10-26 12:00:00.125 DEBUG [runic] read 'examples/test.html/index.html' => 1024 bytes
+2026-10-26 12:00:00.130 DEBUG [runic] exec 'uname -a' => code: 0, output: 'Linux hostname 6.1.0...'
 ```
 
-### Launch in debug mode:
-
-```bash
-cargo run -- examples/test.html/index.html --debug
-```
-
-**Important**: In normal mode (without `--debug`), the program runs quietly — no console output and no error messages sent to the widget (except critical startup errors). This allows using Runic in production without log pollution.
+**Important**: In normal mode (without `--debug`), the program runs quietly — no console output (except critical startup errors). This allows using Runic in production without log pollution.
 
 ## License
 
@@ -255,6 +236,6 @@ MIT
 
 Inspired by [Conky](https://github.com/brndnmtthws/conky) and built with excellent Rust bindings:
 
-- [gtk-rs](https://github.com/gtk-rs/gtk3-rs)
-- [webkit2gtk-rs](https://github.com/nicokosi/webkit2gtk-rs)
-- [gtk-layer-shell-rs](https://github.com/Smithay/gtk-layer-shell-rs)
+- [gtk4-rs](https://github.com/gtk-rs/gtk4-rs)
+- [webkit6-rs](https://crates.io/crates/webkit6)
+- [gtk4-layer-shell-rs](https://github.com/Smithay/gtk4-layer-shell-rs)
