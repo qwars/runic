@@ -4,6 +4,36 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/),
 
+## [2.0.0] - 2026-10-26
+
+### 🏗️ Миграция на GTK4 + WebKit6 + JavaScriptCore6
+- **GTK3 → GTK4 (v0.11, v4_14)**: Полный переход на GTK4 API.
+- **webkit2gtk → webkit6 (v0.6)**: Обновление до WebKitGTK 6.0.
+- **javascriptcore6 (v0.6)**: Обработка JS-значений через JavaScriptCore вместо старого GValue.
+- **gtk4-layer-shell (v0.8)**: Адаптирован для GTK4.
+- **glib 0.22**: Обновление до актуальной версии.
+
+### ✨ Новое
+- **Hot-reload без feature-gating**: Горячая перезагрузка виджета теперь работает во всех сборках (не только debug), использует `gio::FileMonitor` с `Cancellable` и пересоздаёт окно через `WidgetEvent::Stop`/`Start`.
+- **env_logger вместо кастомного цветного вывода**: Стандартный Rust-логгер с форматированием по уровню (`Debug`/`Info`). Режим отладки управляется флагом `-d`/`--debug` на уровне логирования (runtime), без разделения сборок.
+- **async-channel для ThreadPool**: Переход с `std::sync::mpsc` на `async-channel` (bounded, 1024 задачи) для канала задач пула потоков.
+- **Событийная модель жизненного цикла**: `WidgetEvent::Stop`/`Start` — окно полностью пересоздаётся при hot-reload и выходе из сна.
+- **Обработка сигналов через signal-hook**: SIGTERM/SIGINT перехватываются через `signal_hook` для корректного graceful shutdown.
+
+### ⚙️ Изменено
+- **ProcessGuard вместо ChildGuard**: Новая структура с `child: Option<Child>` и `group_id`, использует `killpg(SIGTERM)` + адаптивное ожидание + `killpg(SIGKILL)`. Константы `KILL_GRACE_ITERATIONS` (10) и `KILL_GRACE_INTERVAL_MS` (10).
+- **ApplicationState упрощён**: `executions` — `HashSet<u32>` (только PID), `watchers` — `HashMap<String, Watcher>` с `WatchTarget` (File/Directory), `reload_cancellation` — `Option<gio::Cancellable>`.
+- **Удалён ThreadTracker**: Больше нет трекинга потоков с профилированием памяти и CPU. Статистика (`stats`) возвращает только счётчики: streams, watchers, execs, queue.
+- **Удалён `safe_lock`**: Переход на `parking_lot::Mutex` — мьютексы не отравляются при панике.
+- **watch_file использует мониторинг директории**: Следит за родительской директорией, корректно переоткрывает файл при изменении inode/device (пересоздание файла).
+- **build_response упрощён**: Генерирует `if (window.onRunicResponse) window.onRunicResponse(...);` одной JSON-сериализацией вместо трёх аллокаций.
+- **compose_command использует shlex**: Единый парсинг команд через `shlex::split`.
+- **Edition 2024**: Обновлён Rust edition.
+
+### 🔧 Зависимости
+- **Добавлены**: `gtk4`, `webkit6`, `javascriptcore6`, `gtk4-layer-shell`, `async-channel`, `futures-lite`, `signal-hook`, `env_logger`, `parking_lot`
+- **Удалены**: зависимости GTK3-стека, `inotify`, кастомные реализации
+
 ## [1.7.0] - 2026-10-19
 
 ### Изменено
